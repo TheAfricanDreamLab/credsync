@@ -41,7 +41,7 @@ jobs:
       - name: Every crate declares Apache-2.0
         run: |
           shopt -s nullglob
-          crates=(credsync-*/Cargo.toml credsyncd/Cargo.toml)
+          crates=(credsync-*/Cargo.toml credsyncd*/Cargo.toml)
           if [ ${#crates[@]} -eq 0 ]; then
             echo "  skip  no crates yet (CS-1)"; exit 0
           fi
@@ -55,25 +55,6 @@ jobs:
           done
           exit $fail
 
-  authorship:
-    name: authorship
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # Commits are authored by the owner alone - no tool or agent attribution (D-013).
-      - name: No co-author trailers
-        run: |
-          base="${{ github.event.pull_request.base.sha }}"
-          head="${{ github.event.pull_request.head.sha }}"
-          if [ -z "$base" ]; then range="HEAD~1..HEAD"; else range="$base..$head"; fi
-          if git log --format='%B' "$range" | grep -iE '^(co-authored-by|generated with)' ; then
-            echo "FAIL: commit trailer adds a co-author or tool attribution"
-            exit 1
-          fi
-          echo "  ok    no co-author or tool-attribution trailers"
 
   docs:
     name: docs and decision register

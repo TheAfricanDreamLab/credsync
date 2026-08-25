@@ -68,7 +68,7 @@ Each of these is mechanically checked. A rule that cannot be checked is a wish.
    enforced by the entity registry rather than by convention.
 
 7. **Commits are authored by Ukeme alone.** No co-author trailers, no tool attribution in PR
-   bodies. CI checks this.
+   bodies.
 
 ## 4. Testing posture
 

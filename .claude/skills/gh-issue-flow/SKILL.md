@@ -42,7 +42,7 @@ Commits follow Conventional Commits — `feat:`, `fix:`, `test:`, `docs:`, `chor
 referencing the issue.
 
 **Commits are authored by Ukeme alone.** No `Co-Authored-By` trailer, no tool attribution
-anywhere in the commit or PR. CI checks this (D-013).
+anywhere in the commit or PR (D-013).
 
 ## Prove
 

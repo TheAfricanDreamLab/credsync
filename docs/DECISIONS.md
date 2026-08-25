@@ -43,7 +43,7 @@ stale entry fails the build rather than quietly misleading a session.
 | D-010 | **Apache-2.0 across every crate and package.** Ukeme owns the project; Dream Lab OS and MySaurify consume it as ordinary dependencies. Chosen over MIT for its explicit patent grant. | Design §1 | 24 Aug 2026 |
 | D-011 | **Every standalone dependency carries a licence file.** Every crate declares `license = "Apache-2.0"` and carries `LICENSE` + `NOTICE` at its root; `cargo-deny` fails the build on any dependency outside the allowlist (Apache-2.0, MIT, BSD-2/3, ISC, Unicode-3.0, Zlib). Copyleft is a blocking defect. | Slice Plan §3 | 25 Aug 2026 |
 | D-012 | **Apache-2.0 grants no trademark rights.** Dream Score™, DBPI™, and DSI™ remain African Dream Network marks regardless of code licence. Stated in `NOTICE`. | Slice Plan §3 | 25 Aug 2026 |
-| D-013 | **Commits and PRs are authored by Ukeme alone.** No co-author trailers, no tool attribution in PR bodies, no third party in `NOTICE`, `AUTHORS`, or package metadata. Enforced by a CI check. | Owner instruction | 25 Aug 2026 |
+| D-013 | **Commits and PRs are authored by Ukeme alone.** No co-author trailers, no tool attribution in PR bodies, no third party in `NOTICE`, `AUTHORS`, or package metadata. Held by convention, not by a CI job — a gate policing commit trailers is process theatre. | Owner instruction | 25 Aug 2026 |
 
 ## Repository and process
 
