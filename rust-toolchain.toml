@@ -1,0 +1,8 @@
+# Pinned exactly, never floating (DECISIONS.md D-021).
+# A toolchain change mid-project could alter behaviour under us, which is unacceptable for a
+# system whose core promise is that a seed replays identically forever.
+# Bumping this is a deliberate PR that re-runs the full nightly seed batch.
+[toolchain]
+channel    = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile    = "minimal"
