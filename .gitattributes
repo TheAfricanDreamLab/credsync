@@ -1,0 +1,22 @@
+# Normalise to LF in the repository for everything textual.
+* text=auto eol=lf
+
+# Shell scripts MUST be LF. A CRLF shebang line ("#!/usr/bin/env bash\r") fails with an
+# obscure "bad interpreter" error, and CI runs on Linux.
+*.sh    text eol=lf
+*.mjs   text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+
+# Binary - never touch, never diff as text.
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.docx  binary
+*.pdf   binary
+
+# Generated: collapse in PR diffs so a re-conversion does not bury the real change.
+docs/platform-plan-v1.1.md       linguist-generated=true
+docs/credsync-design-v2.1.md     linguist-generated=true
+docs/execution-playbook-v1.0.md  linguist-generated=true

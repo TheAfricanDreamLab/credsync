@@ -1,0 +1,12 @@
+{
+  "name": "credsync-doc-tools",
+  "private": true,
+  "type": "module",
+  "description": "Word-to-markdown conversion for the planning documents in docs/source/",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "mammoth": "^1.11.0",
+    "turndown": "^7.2.2",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}

@@ -1,0 +1,117 @@
+# CS-0 CI: checks the REPO. CS-1 adds the jobs that check the CODE (DECISIONS.md D-019).
+# There are no crates until CS-1, so a Rust job here would have nothing to compile.
+name: repo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  licence:
+    name: licence and notice
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Root LICENSE and NOTICE present
+        run: |
+          fail=0
+          for f in LICENSE NOTICE; do
+            if [ -f "$f" ]; then echo "  ok    $f"; else echo "  FAIL  $f missing"; fail=1; fi
+          done
+          exit $fail
+
+      - name: LICENSE is Apache-2.0
+        run: |
+          grep -q "Apache License" LICENSE || { echo "LICENSE is not Apache-2.0"; exit 1; }
+          grep -q "Version 2.0" LICENSE     || { echo "LICENSE is not version 2.0"; exit 1; }
+          echo "  ok    Apache-2.0"
+
+      - name: NOTICE carries the trademark carve-out
+        run: |
+          grep -q "TRADEMARKS" NOTICE || { echo "NOTICE missing trademark section"; exit 1; }
+          echo "  ok    trademark carve-out present"
+
+      # From CS-1, every crate must declare its licence. Until crates exist this is a no-op
+      # rather than a hardcoded future date, so the gate turns itself on.
+      - name: Every crate declares Apache-2.0
+        run: |
+          shopt -s nullglob
+          crates=(credsync-*/Cargo.toml credsyncd/Cargo.toml)
+          if [ ${#crates[@]} -eq 0 ]; then
+            echo "  skip  no crates yet (CS-1)"; exit 0
+          fi
+          fail=0
+          for c in "${crates[@]}"; do
+            if grep -q 'license *= *"Apache-2.0"' "$c"; then
+              echo "  ok    $c"
+            else
+              echo "  FAIL  $c has no Apache-2.0 licence field"; fail=1
+            fi
+          done
+          exit $fail
+
+  authorship:
+    name: authorship
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Commits are authored by the owner alone - no tool or agent attribution (D-013).
+      - name: No co-author trailers
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$base" ]; then range="HEAD~1..HEAD"; else range="$base..$head"; fi
+          if git log --format='%B' "$range" | grep -iE '^(co-authored-by|generated with)' ; then
+            echo "FAIL: commit trailer adds a co-author or tool attribution"
+            exit 1
+          fi
+          echo "  ok    no co-author or tool-attribution trailers"
+
+  docs:
+    name: docs and decision register
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Decision register citations resolve
+        run: ./scripts/check-decisions.sh
+
+      # Regenerate from the .docx originals and fail if the result differs from what was
+      # committed. Catches a hand-edited docs/*.md, which would silently diverge from source.
+      - name: Generated docs match their sources
+        run: |
+          ./scripts/convert-docs.sh
+          if ! git diff --quiet -- docs/; then
+            echo "FAIL: docs/ differs from a fresh conversion of docs/source/"
+            echo "Run ./scripts/convert-docs.sh and commit the result."
+            git diff --stat -- docs/
+            exit 1
+          fi
+          echo "  ok    docs match their sources"
+
+      - name: Spec four-page ceiling
+        run: |
+          if [ ! -f docs/spec.md ]; then
+            echo "  skip  spec.md not yet written (CS-2)"; exit 0
+          fi
+          # ~46 lines per page at the spec's formatting; the ceiling is a scope alarm (D-003).
+          lines=$(wc -l < docs/spec.md)
+          limit=190
+          echo "  spec.md: $lines lines (limit $limit)"
+          if [ "$lines" -gt "$limit" ]; then
+            echo "FAIL: spec.md exceeds the four-page ceiling. Scope has crept - cut it."
+            exit 1
+          fi
+          echo "  ok    within ceiling"
