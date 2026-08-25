@@ -13,7 +13,11 @@ One issue per session by default. A second only if the first closed.
 ## Slice IDs vs issue numbers
 
 **Slice CS-N is GitHub issue #N+1.** GitHub numbers start at 1, so `CS-0` is issue #1 and `CS-32`
-is issue #33 (D-016). Issue *titles* carry the slice ID; *branches* carry the GitHub number.
+is issue #33 (D-016).
+
+Titles and branches carry the **slice ID**; only `Closes #N` uses the GitHub number. CS-1 is
+issue #2 on branch `feat/cs-1-<slug>`, and its PR says `Closes #2`. Keeping the slice ID in the
+branch means the branch name matches the plan, which is what you are actually working from.
 
 ## Open — before writing any code
 
@@ -26,7 +30,7 @@ is issue #33 (D-016). Issue *titles* carry the slice ID; *branches* carry the Gi
 
 ```sh
 git checkout main && git pull
-git checkout -b feat/cs-<issue#>-<slug>      # or fix/cs-<issue#>-<slug>
+git checkout -b feat/cs-<slice-id>-<slug>    # or fix/cs-<slice-id>-<slug>
 ```
 
 ## Build

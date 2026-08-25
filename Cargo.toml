@@ -1,0 +1,50 @@
+# credSync workspace.
+#
+# Crate layout follows credSync Design v2.1 section 9. The boundary that matters most:
+# credsync-core is sans-IO (DECISIONS.md D-002) and must never acquire a dependency that
+# touches the outside world. CI asserts this with `cargo tree`; see .github/workflows/rust.yml.
+
+[workspace]
+resolver = "3"
+members = [
+    "credsync-protocol",
+    "credsync-core",
+    "credsync-server",
+    "credsyncd",
+    "credsync-sim",
+    "credsync-ffi",
+]
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2024"
+rust-version = "1.98"
+license      = "Apache-2.0"
+authors      = ["Ukeme Ikot"]
+repository   = "https://github.com/TheAfricanDreamLab/credsync"
+homepage     = "https://github.com/TheAfricanDreamLab/credsync"
+categories   = ["database", "network-programming"]
+keywords     = ["sync", "offline-first", "crdt-free", "replication"]
+
+[workspace.lints.rust]
+missing_docs                = "warn"
+unreachable_pub             = "warn"
+unused_qualifications       = "warn"
+
+[workspace.lints.clippy]
+# A silent panic in a decoder is a remote crash; a silent unwrap in the core is lost user
+# data. Both are denied rather than warned so they cannot accumulate.
+unwrap_used     = "deny"
+expect_used     = "deny"
+panic           = "deny"
+todo            = "deny"
+unimplemented    = "deny"
+# Determinism: iterating a HashMap is a real nondeterminism source in a seeded simulator.
+# See .claude/skills/rust-sans-io/SKILL.md.
+iter_over_hash_type = "deny"
+
+[profile.release]
+lto           = true
+codegen-units = 1
+strip         = true
+panic         = "abort"

@@ -1,0 +1,43 @@
+# cargo-deny configuration.
+#
+# The licence allowlist is the mechanism behind DECISIONS.md D-011: every standalone dependency
+# carries a licence, and copyleft is a blocking defect rather than a conversation. credSync is
+# Apache-2.0 and its consumers (Dream Lab OS, MySaurify) link it as an ordinary dependency, so a
+# GPL transitive would be an licensing problem inherited by everyone downstream.
+
+[graph]
+all-features = true
+
+[licenses]
+# Permissive only. Anything outside this list fails the build; widening it is a deliberate PR
+# that records the reasoning in DECISIONS.md.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# The sans-IO rule (DECISIONS.md D-002) as a dependency ban, not just a convention.
+#
+# `cargo tree` in CI proves credsync-core's graph is clean; this catches the same class of
+# mistake earlier and with a clearer message. These crates are legitimate elsewhere in the
+# workspace - tokio and axum belong in credsyncd - so the ban is scoped by `wrappers` rather
+# than being global.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+# A sync engine handling student coursework on shared devices; an unpatched advisory in the
+# dependency graph is not acceptable.
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
