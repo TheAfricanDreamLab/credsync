@@ -1,0 +1,121 @@
+# CS-1 CI: checks the CODE. The repo-hygiene gates live in repo.yml (DECISIONS.md D-019).
+#
+# These jobs are attached as required status checks on `main`. Weakening one to get a merge
+# through is the single forbidden move in this repo - see CLAUDE.md section 3.
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning that nobody sees becomes a warning that nobody fixes.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain input: rust-toolchain.toml pins the exact version (D-021), and letting the
+      # action override it would defeat the pin.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Toolchain matches the pin
+        run: |
+          pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          actual=$(rustc --version | awk '{print $2}')
+          echo "  pinned: $pinned   actual: $actual"
+          [ "$pinned" = "$actual" ] || { echo "FAIL: toolchain does not match rust-toolchain.toml"; exit 1; }
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+      - name: cargo doc
+        # Docs are part of the deliverable for a library others are meant to adopt; a broken
+        # intra-doc link is a defect like any other.
+        run: cargo doc --workspace --no-deps --all-features
+
+  sans-io:
+    name: core is sans-IO
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # DECISIONS.md D-002. This is the gate that keeps deterministic simulation possible.
+      # A single I/O dependency reaching the core destroys replay silently: the simulator keeps
+      # passing while quietly losing the ability to find anything.
+      - name: No I/O crates in the credsync-core graph
+        run: |
+          tree=$(cargo tree -p credsync-core --edges normal --prefix none --no-dedupe)
+          echo "$tree"
+          fail=0
+          for banned in tokio async-std smol reqwest hyper ureq rusqlite libsqlite3-sys \
+                        mio socket2 getrandom rand std-time chrono time-core; do
+            if echo "$tree" | grep -qE "^${banned} "; then
+              echo "FAIL: '${banned}' is in the credsync-core dependency graph"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  deny:
+    name: licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # DECISIONS.md D-011: every dependency's licence is checked, and copyleft is a blocking
+      # defect rather than a conversation. credSync is consumed as an ordinary dependency by
+      # Dream Lab OS and MySaurify, so a GPL transitive would be inherited by both.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources advisories
+
+  crate-metadata:
+    name: crate licence metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Each crate is published individually, so each must carry its own licence declaration
+      # and its own LICENSE/NOTICE files. Extraction to a separate repo then stays a `git mv`.
+      - name: Every crate declares Apache-2.0 and carries LICENSE + NOTICE
+        run: |
+          fail=0
+          for dir in credsync-* credsyncd; do
+            [ -f "$dir/Cargo.toml" ] || continue
+            if grep -qE 'license(\.workspace *= *true| *= *"Apache-2.0")' "$dir/Cargo.toml"; then
+              echo "  ok    $dir  licence declared"
+            else
+              echo "  FAIL  $dir  no Apache-2.0 licence"; fail=1
+            fi
+            for f in LICENSE NOTICE; do
+              if [ -e "$dir/$f" ]; then
+                echo "  ok    $dir/$f"
+              else
+                echo "  FAIL  $dir/$f missing"; fail=1
+              fi
+            done
+          done
+          exit $fail

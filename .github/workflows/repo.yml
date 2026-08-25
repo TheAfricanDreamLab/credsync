@@ -1,5 +1,7 @@
-# CS-0 CI: checks the REPO. CS-1 adds the jobs that check the CODE (DECISIONS.md D-019).
-# There are no crates until CS-1, so a Rust job here would have nothing to compile.
+# CS-0 CI: checks the REPO. rust.yml checks the CODE (DECISIONS.md D-019).
+#
+# Per-crate licence metadata is checked by rust.yml's `crate-metadata` job, not here: crates can
+# inherit `license.workspace = true`, which a literal grep in this workflow got wrong at CS-1.
 name: repo
 
 on:
@@ -35,25 +37,6 @@ jobs:
         run: |
           grep -q "TRADEMARKS" NOTICE || { echo "NOTICE missing trademark section"; exit 1; }
           echo "  ok    trademark carve-out present"
-
-      # From CS-1, every crate must declare its licence. Until crates exist this is a no-op
-      # rather than a hardcoded future date, so the gate turns itself on.
-      - name: Every crate declares Apache-2.0
-        run: |
-          shopt -s nullglob
-          crates=(credsync-*/Cargo.toml credsyncd*/Cargo.toml)
-          if [ ${#crates[@]} -eq 0 ]; then
-            echo "  skip  no crates yet (CS-1)"; exit 0
-          fi
-          fail=0
-          for c in "${crates[@]}"; do
-            if grep -q 'license *= *"Apache-2.0"' "$c"; then
-              echo "  ok    $c"
-            else
-              echo "  FAIL  $c has no Apache-2.0 licence field"; fail=1
-            fi
-          done
-          exit $fail
 
 
   docs:

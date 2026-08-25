@@ -1,0 +1,15 @@
+[package]
+name        = "credsync-core"
+description = "Sans-IO deterministic state machine for credSync clients: sync loop, outbox, cursors, conflict application"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+
+[lints]
+workspace = true
+
+[dependencies]

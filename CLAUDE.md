@@ -23,7 +23,8 @@ restatement of an issue does not match what the issue says, the issue is unclear
 first, before writing code.
 
 Slice IDs and issue numbers differ by one: **slice CS-N is GitHub issue #N+1** (`CS-0` is #1,
-`CS-32` is #33). Titles carry the slice ID; branches carry the GitHub number.
+`CS-32` is #33). Titles and branches both carry the **slice ID**; only `Closes #N` uses the
+GitHub number. So CS-1 is issue #2 on a branch named `feat/cs-1-<slug>`.
 
 ## 2. Repo map
 
