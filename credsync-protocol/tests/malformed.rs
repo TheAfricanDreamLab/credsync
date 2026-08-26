@@ -249,3 +249,82 @@ fn misordered_batch_does_not_decode() {
     );
     assert!(canonical::from_slice::<Batch>(body(1, 2).as_bytes()).is_ok());
 }
+
+/// Collection bounds must bite **during** deserialization, not after it.
+///
+/// `#[serde(try_from = ...)]` builds the whole representation before validating, so a count check
+/// there fires only once every entry has been parsed and allocated. A client sending a million
+/// commands would allocate a million commands to be told it sent too many — memory amplification
+/// on a protocol whose users are on constrained devices.
+///
+/// The decisive case is the last one: the first over-limit entry is structurally valid JSON but
+/// invalid as a `Command`. If the bound were applied after full deserialization, the error would
+/// be about *that entry*. It must instead be about the collection limit, proving the decoder
+/// stopped before constructing it.
+#[test]
+fn collection_bounds_apply_during_deserialization() {
+    use credsync_protocol::limits;
+
+    let cmd = r#"{"id":"0190f8c1-2a3b-7c4d-8e5f-60718293a4b5","name":"submit","scope":"s",
+        "payload":{},"client_ts":0,"checksum":"ab"}"#;
+
+    let push = |n: usize, tail: &str| {
+        let mut items: Vec<String> = (0..n).map(|_| cmd.to_string()).collect();
+        if !tail.is_empty() {
+            items.push(tail.to_string());
+        }
+        format!(r#"{{"protocol":1,"commands":[{}]}}"#, items.join(","))
+    };
+
+    // At the limit: accepted.
+    let at = push(limits::COMMANDS_MAX_COUNT, "");
+    assert!(
+        canonical::from_slice::<PushRequest>(at.as_bytes()).is_ok(),
+        "the legal maximum was rejected"
+    );
+
+    // One over, all entries valid: refused.
+    let over = push(limits::COMMANDS_MAX_COUNT, cmd);
+    let err = canonical::from_slice::<PushRequest>(over.as_bytes())
+        .expect_err("an over-limit push decoded");
+    assert!(
+        err.to_string().contains("bounded collection"),
+        "expected a collection-limit error, got: {err}"
+    );
+
+    // One over, where the over-limit entry is valid JSON but not a valid Command. The error must
+    // still be the collection limit - if it names the entry, the bound ran too late.
+    let poisoned = push(limits::COMMANDS_MAX_COUNT, r#"{"not":"a command"}"#);
+    let err = canonical::from_slice::<PushRequest>(poisoned.as_bytes())
+        .expect_err("an over-limit push decoded");
+    assert!(
+        err.to_string().contains("bounded collection"),
+        "the over-limit entry was deserialised before the bound applied: {err}"
+    );
+}
+
+/// The same, for a pull request's scope list.
+#[test]
+fn scope_list_bound_applies_during_deserialization() {
+    use credsync_protocol::limits;
+
+    let scope = r#"{"scope":"s","cursor":0}"#;
+    let pull = |n: usize, tail: &str| {
+        let mut items: Vec<String> = (0..n).map(|_| scope.to_string()).collect();
+        if !tail.is_empty() {
+            items.push(tail.to_string());
+        }
+        format!(r#"{{"protocol":1,"scopes":[{}]}}"#, items.join(","))
+    };
+
+    let at = pull(limits::SCOPES_MAX_COUNT, "");
+    assert!(canonical::from_slice::<PullRequest>(at.as_bytes()).is_ok());
+
+    let poisoned = pull(limits::SCOPES_MAX_COUNT, r#"{"nope":1}"#);
+    let err = canonical::from_slice::<PullRequest>(poisoned.as_bytes())
+        .expect_err("an over-limit pull decoded");
+    assert!(
+        err.to_string().contains("bounded collection"),
+        "the over-limit entry was deserialised before the bound applied: {err}"
+    );
+}

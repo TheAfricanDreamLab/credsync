@@ -17,9 +17,67 @@
 
 use crate::error::{ProtocolError, Result};
 use crate::ids::{CommandId, EntityId, EntityName, HexString, Reason, ScopeId};
+use crate::limits;
 use crate::nums::{Cursor, LimitBytes, ProtocolVersion, RowVersion, SchemaVersion, Seq};
 use crate::wire::{Batch, Change, Command, CommandResult, Op, PushRequest, Snapshot, Status};
-use serde::Deserialize;
+use core::marker::PhantomData;
+use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+
+/// A `Vec` that refuses to grow past `MAX` **while deserializing**, not after.
+///
+/// `#[serde(try_from = ...)]` builds the entire representation before `TryFrom` runs, so a
+/// count check there fires only once every entry has already been parsed and allocated. A client
+/// sending a million commands would allocate a million commands in order to be told it sent too
+/// many — memory amplification on a protocol whose users are on constrained devices.
+///
+/// This stops at the limit and then probes for one more element as [`IgnoredAny`], which skips
+/// the tokens without constructing `T` or running its validation. So an over-limit request is
+/// refused for being over-limit, rather than for whatever happens to be wrong with entry 257.
+struct Bounded<T, const MAX: usize>(Vec<T>);
+
+impl<'de, T, const MAX: usize> Deserialize<'de> for Bounded<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(d: D) -> core::result::Result<Self, D::Error> {
+        struct V<T, const MAX: usize>(PhantomData<T>);
+
+        impl<'de, T, const MAX: usize> Visitor<'de> for V<T, MAX>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = Vec<T>;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, "a sequence of at most {MAX} items")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> core::result::Result<Vec<T>, A::Error> {
+                // Capacity is capped at MAX so a hostile size hint cannot pre-allocate.
+                let hint = seq.size_hint().unwrap_or(0).min(MAX);
+                let mut out = Vec::with_capacity(hint);
+                while out.len() < MAX {
+                    match seq.next_element::<T>()? {
+                        Some(item) => out.push(item),
+                        None => return Ok(out),
+                    }
+                }
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(format!(
+                        "more than {MAX} items in a bounded collection"
+                    )));
+                }
+                Ok(out)
+            }
+        }
+
+        d.deserialize_seq(V::<T, MAX>(PhantomData)).map(Bounded)
+    }
+}
 
 /// Mirror of [`Change`].
 #[derive(Deserialize)]
@@ -107,7 +165,7 @@ impl TryFrom<CommandResultRepr> for CommandResult {
 #[derive(Deserialize)]
 pub(crate) struct PushRequestRepr {
     protocol: ProtocolVersion,
-    commands: Vec<Command>,
+    commands: Bounded<Command, { limits::COMMANDS_MAX_COUNT }>,
 }
 
 impl TryFrom<PushRequestRepr> for PushRequest {
@@ -115,8 +173,9 @@ impl TryFrom<PushRequestRepr> for PushRequest {
     fn try_from(r: PushRequestRepr) -> Result<Self> {
         let request = Self {
             protocol: r.protocol,
-            commands: r.commands,
+            commands: r.commands.0,
         };
+        // Still runs: the count is already bounded, but the 1 MB total-bytes limit is not.
         request.validate()?;
         Ok(request)
     }
@@ -126,7 +185,7 @@ impl TryFrom<PushRequestRepr> for PushRequest {
 #[derive(Deserialize)]
 pub(crate) struct PullRequestRepr {
     protocol: ProtocolVersion,
-    scopes: Vec<crate::wire::ScopeCursor>,
+    scopes: Bounded<crate::wire::ScopeCursor, { limits::SCOPES_MAX_COUNT }>,
     #[serde(default)]
     limit_bytes: Option<LimitBytes>,
 }
@@ -136,9 +195,10 @@ impl TryFrom<PullRequestRepr> for crate::PullRequest {
     fn try_from(r: PullRequestRepr) -> Result<Self> {
         let request = Self {
             protocol: r.protocol,
-            scopes: r.scopes,
+            scopes: r.scopes.0,
             limit_bytes: r.limit_bytes,
         };
+        // Kept so the programmatic path is checked too; deserialization already bounded it.
         request.validate()?;
         Ok(request)
     }
