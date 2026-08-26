@@ -136,7 +136,50 @@ Docs are generated, so if you touched `docs/source/`:
 Paste the command **and its result summary** into the PR under `## Test evidence`. A PR without
 test evidence is not ready, however green CI looks.
 
-## 6. Pointers
+## 6. Building on Windows
+
+Rust's msvc target needs the **MSVC linker**, and rustup does not install it. Without it every
+crate that links fails — binaries and test harnesses both — and so does `cargo install cargo-deny`,
+whose build scripts link too. That last one is easy to misread as a separate problem; it is not.
+
+```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools --override `
+  "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+It installs under **`Program Files (x86)`**, not `Program Files`:
+
+```
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools
+```
+
+Looking in the wrong one makes a successful install look like a failed one. `vswhere.exe`
+(`C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe`) reports the real path.
+
+Run cargo inside the MSVC environment:
+
+```powershell
+$vc = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cmd /c "`"$vc`" >nul && cargo test --workspace"
+```
+
+**One red herring worth knowing.** Under git-bash a missing linker reports as:
+
+```
+link: extra operand '...rcgu.o'
+Try 'link --help' for more information.
+```
+
+That is git-bash's GNU `link` (coreutils) shadowing `link.exe`, and it reads like a PATH-ordering
+bug. It is not — `link.exe` is simply absent. PowerShell gives the honest error
+(`linker 'link.exe' not found`), so **diagnose linker problems from PowerShell, not git-bash.**
+
+Verified on Windows at CS-1: `cargo test --workspace` and
+`cargo deny check licenses bans sources advisories` both pass once Build Tools is present.
+
+CI runs on Linux and is unaffected by any of this.
+
+## 7. Pointers
 
 | For | Read |
 |---|---|
@@ -148,7 +191,7 @@ test evidence is not ready, however green CI looks.
 
 Skills live in `.claude/skills/`. Issue templates name which ones a slice needs — load them.
 
-## 7. When you learn something
+## 8. When you learn something
 
 Anything a future session needs — a build quirk, a pattern, a trap — is committed as a skill edit
 or a line here, **in the same PR that discovered it**. The repo gets smarter every slice. A lesson
