@@ -39,6 +39,7 @@ GitHub number. So CS-1 is issue #2 on a branch named `feat/cs-1-<slug>`.
 | `docs/` | **Generated** from `docs/source/*.docx` — never hand-edit. Run `scripts/convert-docs.sh` |
 | `docs/spec.md` | The protocol. Written at CS-2. Four pages, hard ceiling |
 | `scripts/seed-backlog.sh` | Reconciles GitHub issues with the Slice Plan. Idempotent |
+| `scripts/sync-fork.sh` | Fast-forwards the owner's personal fork after a merge. Idempotent |
 
 Crates are scaffolded at CS-1; before that the repo is docs and process only.
 

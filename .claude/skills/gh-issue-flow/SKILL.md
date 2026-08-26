@@ -79,6 +79,19 @@ $ cargo run -p credsync-sim -- --seeds 1000
 **A PR without test evidence is not ready**, however green CI looks. CI proves the gates passed;
 the evidence block proves *you ran the thing the issue asked for*. They are not the same claim.
 
+## After the merge — sync the fork
+
+`ukemeikot/credsync` is the owner's personal copy of this repo (D-014). Fast-forward it once the
+merge lands:
+
+```sh
+./scripts/sync-fork.sh        # idempotent; a no-op when already in sync
+```
+
+A fork that silently rots is worse than no fork: it looks like a copy of the project while being
+a copy of the project as it was weeks ago. The script verifies the result rather than assuming
+it, because `gh repo sync` declines to fast-forward a diverged fork without being loud about it.
+
 ## Learn
 
 Anything this session discovered that a future one needs — a build quirk, a pattern, a trap —
