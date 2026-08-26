@@ -136,6 +136,12 @@ Docs are generated, so if you touched `docs/source/`:
 Paste the command **and its result summary** into the PR under `## Test evidence`. A PR without
 test evidence is not ready, however green CI looks.
 
+**Review.** CodeRabbit reviews every PR against `.coderabbit.yaml`, which encodes the
+non-negotiables above as per-path instructions — the sans-IO ban list, canonical-encoding rules,
+the spec's one-rule-one-place requirement, and gates that cannot fail. It runs `assertive`: a
+review that mostly agrees with you is worth nothing when there is no second engineer to disagree.
+Address its findings or say why not; do not merge past an unanswered one.
+
 ## 6. Building on Windows
 
 Rust's msvc target needs the **MSVC linker**, and rustup does not install it. Without it every

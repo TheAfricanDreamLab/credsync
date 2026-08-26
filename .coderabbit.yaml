@@ -1,0 +1,104 @@
+# CodeRabbit configuration.
+#
+# Second reviewer for a solo build. Playbook section 5 makes the CI gates the reviewer, but gates
+# only catch what someone thought to encode; CodeRabbit is there for what nobody thought to encode.
+#
+# Profile is `assertive` deliberately: a review that mostly agrees with you is worth nothing when
+# there is no second engineer to disagree.
+#
+# Schema: https://coderabbit.ai/integrations/schema.v2.json
+
+language: en-GB
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  collapse_walkthrough: false
+  poem: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  # Skip generated and vendored content. docs/*.md is produced by scripts/convert-docs.sh from
+  # the Word originals, so reviewing it means reviewing Word's output, not anyone's decision.
+  path_filters:
+    - "!docs/platform-plan-v1.1.md"
+    - "!docs/credsync-design-v2.1.md"
+    - "!docs/execution-playbook-v1.0.md"
+    - "!docs/images/**"
+    - "!docs/source/**"
+    - "!scripts/lib/node_modules/**"
+    - "!**/*.lock"
+
+  path_instructions:
+    - path: "credsync-core/**"
+      instructions: |
+        This crate is SANS-IO and that property is load-bearing: it is what makes deterministic
+        simulation possible. Flag as a blocking defect any of the following, however small:
+        - Any I/O, filesystem, network, or database access
+        - `Instant::now`, `SystemTime::now`, or any other real clock read
+        - `thread::sleep` or any blocking wait
+        - `rand`, `getrandom`, or any ambient randomness
+        - `tokio`, `async`/`await`, or any executor
+        - Iterating a `HashMap`/`HashSet` where order can affect output (digests, encodings,
+          effect ordering) - iteration order is randomised per process
+        - Any `unsafe`
+        Time must enter as an `Event`, randomness through the `Entropy` trait, I/O as an
+        `Effect` returned to the caller. A single hidden clock read destroys replay silently:
+        the simulator keeps passing while losing the ability to find bugs.
+
+    - path: "credsync-protocol/**"
+      instructions: |
+        Wire code. Check specifically:
+        - Encoding must be CANONICAL - the same logical value always produces identical bytes.
+          Sorted keys, no incidental whitespace, one numeric representation. Flag anything that
+          could make encoding order-dependent, because checksums and digests are computed over it.
+        - Every wire field must enforce the size limit declared in docs/spec.md. Oversize input
+          is REJECTED, never truncated.
+        - Decoders must not panic on malformed or truncated input. A panic in a decoder is a
+          remote crash.
+        - Any change to the wire format must update docs/spec.md, the fixtures, and BOTH codec
+          sides in the SAME pull request. Flag a wire change that touches only one of these.
+
+    - path: "credsync-sim/**"
+      instructions: |
+        The simulator's value is determinism. Flag anything that could make a seeded run
+        non-reproducible: real clocks, ambient randomness, thread scheduling dependence,
+        HashMap iteration order, floating-point accumulation order, or pointer-derived values
+        reaching output.
+        Also flag: weakening a fault distribution, reducing a seed batch size, or marking a sim
+        test ignored. In a deterministic simulator there is no such thing as a flaky test -
+        apparent flakiness IS the bug.
+
+    - path: "docs/spec.md"
+      instructions: |
+        The protocol specification, under a hard four-page ceiling that CI enforces.
+        - Every rule must appear EXACTLY ONCE. Flag any rule restated in two places, because the
+          two copies will drift.
+        - Every wire field must have an explicit declared size limit.
+        - Flag internal inconsistencies: a field used in an endpoint but absent from the limits
+          table, limits that contradict each other, or a broken section cross-reference.
+        - Growth is a scope alarm. If a change makes this longer, ask whether scope crept.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        These are the merge gates and there is no second engineer behind them. Flag anything
+        that weakens a gate: a check made non-blocking, `continue-on-error`, a narrowed path
+        filter, a reduced seed batch, or a step whose failure is swallowed.
+        Also flag gates that CANNOT fail - a check that always passes is worse than no check,
+        because it reads as coverage.
+
+    - path: "**/*.rs"
+      instructions: |
+        Flag `unwrap`, `expect`, `panic!`, `todo!`, and `unimplemented!` in non-test code. A
+        silent panic in a decoder is a remote crash; a silent unwrap in the core is lost user
+        data. Both are denied by workspace lints - flag any attempt to `#[allow]` past them.
+        Every behaviour claim should ship with the test that proves it in the same PR.
+
+chat:
+  auto_reply: true
