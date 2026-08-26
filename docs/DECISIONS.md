@@ -68,6 +68,9 @@ stale entry fails the build rather than quietly misleading a session.
 | D-024 | **Workspace clippy lints deny `unwrap`, `expect`, `panic`, `todo` and `unimplemented`.** A silent panic in a decoder is a remote crash; a silent unwrap in the core is lost user data. Denied rather than warned so they cannot accumulate. `iter_over_hash_type` is denied too: `HashMap` iteration order is randomised per process, a real nondeterminism source inside a seeded simulator. | This slice (CS-1) | 25 Aug 2026 |
 | D-025 | **Release profile sets `lto`, `codegen-units = 1`, `strip` and `panic = "abort"`.** Set at CS-1 rather than CS-25 because the 3 MB-per-ABI size budget is far easier to hold from the start than to claw back once the core is large. | Design §11 | 25 Aug 2026 |
 
+| D-026 | **CodeRabbit reviews every PR, profile `assertive`.** Playbook §5 makes the CI gates the reviewer, but gates only catch what someone thought to encode. `.coderabbit.yaml` carries the non-negotiables as per-path instructions so the review is against this project's rules rather than generic advice. Generated docs are excluded: reviewing them means reviewing Word's output. | This slice (CS-2) | 26 Aug 2026 |
+| D-027 | **The four-page ceiling is enforced as ≤190 lines of `docs/spec.md`.** A line count is a crude proxy for pages but it is unambiguous and cannot be gamed by formatting. Verified to actually fail at CS-2 by padding the file — a gate that cannot fail is worse than no gate, because it reads as coverage. | Design §5; This slice (CS-2) | 26 Aug 2026 |
+
 ## Open — decided at a named slice
 
 These are deliberately unresolved. Each has an owning slice; none may be settled informally.
