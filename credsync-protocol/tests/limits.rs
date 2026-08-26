@@ -68,7 +68,25 @@ boundary!(
     limits::REASON_MAX_BYTES,
     'a'
 );
-boundary!(hex_at_and_over_limit, HexString, limits::HEX_MAX_CHARS, 'a');
+/// Hex needs its own boundary case: `HEX_MAX_CHARS + 1` is odd, so the generic macro would have
+/// asserted `TooLong` against a value actually refused for having an odd length - passing for the
+/// wrong reason. The over-limit value here is even, so length is genuinely what refuses it.
+#[test]
+fn hex_at_and_over_limit() {
+    let at_limit: String = std::iter::repeat_n('a', limits::HEX_MAX_CHARS).collect();
+    assert!(
+        HexString::new(at_limit).is_ok(),
+        "the legal maximum was rejected"
+    );
+
+    let over: String = std::iter::repeat_n('a', limits::HEX_MAX_CHARS + 2).collect();
+    assert_eq!(over.len() % 2, 0, "the over-limit value must be even");
+    let err = HexString::new(over).expect_err("oversize hex accepted");
+    assert!(
+        matches!(err, ProtocolError::TooLong { .. }),
+        "expected TooLong, got {err:?}"
+    );
+}
 
 #[test]
 fn empty_strings_are_refused() {
@@ -180,6 +198,31 @@ fn documents_must_be_objects() {
         );
     }
     assert!(Snapshot::new(json!({})).is_ok());
+}
+
+#[test]
+fn document_at_exactly_the_limit_is_accepted() {
+    // Search for a filler length whose canonical encoding is exactly PAYLOAD_MAX_BYTES, then
+    // assert it is accepted. Without this the suite only proves "far under" and "far over"
+    // behave, never the byte the specification actually names.
+    let mut exact = None;
+    for extra in 0..64usize {
+        let filler = limits::PAYLOAD_MAX_BYTES - 16 + extra;
+        let doc = common::document_of_size(filler);
+        if canonical::canonicalize(&doc).expect("encodes").len() == limits::PAYLOAD_MAX_BYTES {
+            exact = Some(doc);
+            break;
+        }
+    }
+    let doc = exact.expect("a document of exactly the limit should be constructible");
+    assert_eq!(
+        canonical::canonicalize(&doc).expect("encodes").len(),
+        limits::PAYLOAD_MAX_BYTES
+    );
+    assert!(
+        Payload::new(doc).is_ok(),
+        "a payload of exactly PAYLOAD_MAX_BYTES was rejected"
+    );
 }
 
 #[test]
@@ -298,4 +341,75 @@ fn push_enforces_count_and_total_bytes() {
         matches!(too_big.validate(), Err(ProtocolError::TooLong { .. })),
         "32 large commands slipped past the byte limit"
     );
+}
+
+/// The scope list is bounded. An unbounded list would let one request fan out into arbitrarily
+/// many change-log queries.
+#[test]
+fn pull_request_bounds_its_scope_list() {
+    use credsync_protocol::{PullRequest, ScopeCursor};
+
+    let one = ScopeCursor {
+        scope: ScopeId::new("inst:1").expect("valid"),
+        cursor: Cursor::START,
+    };
+    let protocol = ProtocolVersion::new(1).expect("valid");
+
+    let ok = PullRequest {
+        protocol,
+        scopes: vec![one.clone(); limits::SCOPES_MAX_COUNT],
+        limit_bytes: None,
+    };
+    assert!(ok.validate().is_ok(), "the legal maximum was rejected");
+
+    let over = PullRequest {
+        protocol,
+        scopes: vec![one; limits::SCOPES_MAX_COUNT + 1],
+        limit_bytes: None,
+    };
+    assert!(matches!(
+        over.validate(),
+        Err(ProtocolError::TooManyItems { .. })
+    ));
+}
+
+/// A rejected checksum must not report itself as a `digest`. The same type carries both, so the
+/// field name is a parameter - an error naming the wrong field sends a reader to the wrong place.
+#[test]
+fn hex_errors_name_the_field_they_came_from() {
+    match HexString::new_named("checksum", "zz") {
+        Err(ProtocolError::BadCharset { field, .. }) => assert_eq!(field, "checksum"),
+        other => panic!("expected BadCharset for checksum, got {other:?}"),
+    }
+    match HexString::new("zz") {
+        Err(ProtocolError::BadCharset { field, .. }) => assert_eq!(field, "digest"),
+        other => panic!("expected BadCharset for digest, got {other:?}"),
+    }
+}
+
+/// `Reason` is shown to a person, so it accepts UTF-8 rather than ASCII alone - the people using
+/// this platform do not write exclusively in ASCII. Control characters stay out.
+#[test]
+fn reason_accepts_utf8_but_not_control_characters() {
+    assert!(Reason::new("Ekpenyong's submission arrived late").is_ok());
+    assert!(Reason::new("deadline passed \u{2014} see schedule").is_ok());
+    assert!(Reason::new("submiss\u{e3}o atrasada").is_ok());
+    assert!(Reason::new("\u{431}\u{43e}\u{43b}\u{44c}\u{448}\u{435}").is_ok());
+
+    assert!(matches!(
+        Reason::new("bad\u{7}bell"),
+        Err(ProtocolError::BadCharset { .. })
+    ));
+    assert!(matches!(
+        Reason::new("line\nbreak"),
+        Err(ProtocolError::BadCharset { .. })
+    ));
+
+    // The limit is bytes, so a multi-byte reason fits fewer characters.
+    let long: String = std::iter::repeat_n('\u{2014}', limits::REASON_MAX_BYTES).collect();
+    assert!(long.len() > limits::REASON_MAX_BYTES);
+    assert!(matches!(
+        Reason::new(long),
+        Err(ProtocolError::TooLong { .. })
+    ));
 }

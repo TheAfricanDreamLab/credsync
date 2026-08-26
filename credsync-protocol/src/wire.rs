@@ -5,6 +5,9 @@ use crate::error::{ProtocolError, Result};
 use crate::ids::{CommandId, CommandName, EntityId, EntityName, HexString, Reason, ScopeId};
 use crate::limits;
 use crate::nums::{Cursor, LimitBytes, ProtocolVersion, RowVersion, SchemaVersion, Seq};
+use crate::validated::{
+    BatchRepr, ChangeRepr, CommandResultRepr, PullRequestRepr, PushRequestRepr,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -13,9 +16,22 @@ use serde_json::Value;
 /// The protocol does not model its contents but does bound its size and require it to be an
 /// object. Size is measured over the **canonical** encoding, so the limit means the same thing
 /// on both sides regardless of how the sender formatted its JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "Value", into = "Value")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "Value")]
 pub struct Document<const MAX: usize, const FIELD: u8>(Value);
+
+// Serialize is written by hand rather than derived with `#[serde(into = "Value")]`, because that
+// attribute clones the value before converting. A snapshot may be 256 KB, and it is encoded on
+// every digest computation - cloning it each time is a cost with no purpose. Deserialization
+// keeps `try_from`, which is where the validation must happen.
+impl<const MAX: usize, const FIELD: u8> Serialize for Document<MAX, FIELD> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> core::result::Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
 
 /// `snapshot`: at most 256 KB.
 pub type Snapshot = Document<{ limits::SNAPSHOT_MAX_BYTES }, 0>;
@@ -68,6 +84,14 @@ impl<const MAX: usize, const FIELD: u8> TryFrom<Value> for Document<MAX, FIELD> 
 impl<const MAX: usize, const FIELD: u8> From<Document<MAX, FIELD>> for Value {
     fn from(d: Document<MAX, FIELD>) -> Self {
         d.0
+    }
+}
+
+impl<const MAX: usize, const FIELD: u8> Document<MAX, FIELD> {
+    /// Consumes the wrapper, returning the inner JSON.
+    #[must_use]
+    pub fn into_value(self) -> Value {
+        self.0
     }
 }
 
@@ -144,7 +168,11 @@ pub struct EntityRegistration {
 }
 
 /// One entry in the append-only change log. `docs/spec.md` §1.
+///
+/// Deserialization enforces the `op`/`snapshot` rule, so a `Change` that has been decoded is
+/// already known to satisfy it. See [`validated`] for why that is done this way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ChangeRepr")]
 pub struct Change {
     /// Position in the log.
     pub seq: Seq,
@@ -183,7 +211,10 @@ impl Change {
 }
 
 /// One scope's worth of changes. `docs/spec.md` §3.2.
+///
+/// Deserialization enforces strict `seq` ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "BatchRepr")]
 pub struct Batch {
     /// The scope these changes belong to.
     pub scope: ScopeId,
@@ -230,7 +261,10 @@ pub struct ScopeCursor {
 }
 
 /// `GET /sync/pull`. `docs/spec.md` §3.2.
+///
+/// Deserialization enforces the scope-list bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PullRequestRepr")]
 pub struct PullRequest {
     /// Wire protocol version.
     pub protocol: ProtocolVersion,
@@ -239,6 +273,24 @@ pub struct PullRequest {
     /// Client hint for batch size; the server may return less, never more.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub limit_bytes: Option<LimitBytes>,
+}
+
+impl PullRequest {
+    /// Checks the scope-list bound.
+    ///
+    /// # Errors
+    /// Returns [`ProtocolError::TooManyItems`] above 64 scopes. An unbounded list would let one
+    /// request fan out into arbitrarily many change-log queries.
+    pub fn validate(&self) -> Result<()> {
+        if self.scopes.len() > limits::SCOPES_MAX_COUNT {
+            return Err(ProtocolError::TooManyItems {
+                field: "scopes",
+                limit: limits::SCOPES_MAX_COUNT,
+                actual: self.scopes.len(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Response to `GET /sync/pull`.
@@ -316,7 +368,10 @@ pub struct Command {
 }
 
 /// `POST /sync/push`. `docs/spec.md` §3.3.
+///
+/// Deserialization enforces both push limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PushRequestRepr")]
 pub struct PushRequest {
     /// Wire protocol version.
     pub protocol: ProtocolVersion,
@@ -366,7 +421,10 @@ pub enum Status {
 }
 
 /// The outcome of one command.
+///
+/// Deserialization enforces the `status`/`reason` rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CommandResultRepr")]
 pub struct CommandResult {
     /// Which command this answers.
     pub id: CommandId,

@@ -123,18 +123,67 @@ bounded_string!(
     "lowercase ASCII, digits or '_'",
     is_lower_snake
 );
-bounded_string!(
-    Reason,
-    "reason",
-    limits::REASON_MAX_BYTES,
-    "printable text",
-    is_reason_byte
-);
+/// A human-readable rejection reason. `docs/spec.md` §2.1.
+///
+/// Unlike the identifier types this accepts **any UTF-8**, not just ASCII: a reason is shown to
+/// a person, and the people using this platform do not write exclusively in ASCII. Only control
+/// characters are excluded, because they corrupt logs and terminals. The 256-byte limit still
+/// applies and is counted in bytes, so a non-ASCII reason simply fits fewer characters.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Reason(String);
 
-const fn is_reason_byte(b: u8) -> bool {
-    // Human-readable text reaches a user interface, so allow spaces and punctuation but keep
-    // control characters out — they corrupt logs and terminals.
-    b == b' ' || b.is_ascii_graphic()
+impl Reason {
+    /// Validates and wraps a reason.
+    ///
+    /// # Errors
+    /// Returns an error if the value is empty, exceeds 256 bytes, or contains a control
+    /// character.
+    pub fn new(s: impl Into<String>) -> Result<Self> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(ProtocolError::Empty { field: "reason" });
+        }
+        if s.len() > limits::REASON_MAX_BYTES {
+            return Err(ProtocolError::TooLong {
+                field: "reason",
+                limit: limits::REASON_MAX_BYTES,
+                actual: s.len(),
+            });
+        }
+        if s.chars().any(char::is_control) {
+            return Err(ProtocolError::BadCharset {
+                field: "reason",
+                expected: "text without control characters",
+            });
+        }
+        Ok(Self(s))
+    }
+
+    /// Borrows the underlying string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Reason {
+    type Error = ProtocolError;
+    fn try_from(s: String) -> Result<Self> {
+        Self::new(s)
+    }
+}
+
+impl From<Reason> for String {
+    fn from(v: Reason) -> Self {
+        v.0
+    }
+}
+
+impl core::fmt::Display for Reason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// A batch checksum or scope digest: lowercase hex, at most 64 characters.
@@ -147,23 +196,38 @@ const fn is_reason_byte(b: u8) -> bool {
 pub struct HexString(String);
 
 impl HexString {
-    /// Validates and wraps a lowercase hex string.
+    /// Validates and wraps a lowercase hex string, reporting errors against `digest`.
+    ///
+    /// Use [`HexString::new_named`] for a `checksum`, so a rejection names the field the caller
+    /// actually supplied.
     ///
     /// # Errors
     /// Returns an error if the value is empty, longer than 64 characters, contains anything
     /// other than `0-9a-f`, or has an odd length.
     pub fn new(s: impl Into<String>) -> Result<Self> {
+        Self::new_named("digest", s)
+    }
+
+    /// Validates and wraps a lowercase hex string, attributing any error to `field`.
+    ///
+    /// The same type carries both `digest` and `checksum` on the wire, so the field name is a
+    /// parameter: an error reading `digest: ...` for a rejected checksum sends whoever reads it
+    /// to the wrong place.
+    ///
+    /// # Errors
+    /// As [`HexString::new`], with `field` used in the reported error.
+    pub fn new_named(field: &'static str, s: impl Into<String>) -> Result<Self> {
         let s = s.into();
         checked(
-            "digest",
+            field,
             "lowercase hex",
             limits::HEX_MAX_CHARS,
-            |b| b.is_ascii_digit() || b.is_ascii_lowercase() && b <= b'f',
+            is_lower_hex,
             &s,
         )?;
         if s.len() % 2 != 0 {
             return Err(ProtocolError::BadCharset {
-                field: "digest",
+                field,
                 expected: "an even number of hex characters",
             });
         }
@@ -270,6 +334,12 @@ impl CommandId {
         }
         Self::from_bytes(out)
     }
+}
+
+/// The hex alphabet, defined once. [`HexString`] and [`CommandId`] must agree on it, and two
+/// copies of a digest alphabet are two things that can drift apart.
+const fn is_lower_hex(b: u8) -> bool {
+    hex_nibble(b).is_some()
 }
 
 /// Lowercase hex only: an uppercase UUID is a different string and would break byte-stability.

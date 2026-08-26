@@ -35,6 +35,7 @@ pub mod error;
 pub mod ids;
 pub mod limits;
 pub mod nums;
+mod validated;
 pub mod wire;
 
 pub use error::{ProtocolError, Result};

@@ -19,9 +19,14 @@
 //! # Numbers
 //!
 //! Every number the protocol itself defines is an integer, which has exactly one JSON
-//! representation. Floats can still appear inside opaque host data in `snapshot` and `payload`;
-//! `serde_json` formats those with a shortest-round-trip algorithm that is deterministic for a
-//! given value, so re-encoding a decoded document is stable.
+//! representation.
+//!
+//! Floats are **refused** inside `snapshot` and `payload` at any depth (`DECISIONS.md` D-028).
+//! `serde_json` parsing is not exact — a value can re-parse one ULP away and then re-encode
+//! shorter — so a document holding a float does not survive a serialize/parse/serialize cycle
+//! unchanged, and two sides holding the same logical row would compute different digests. Hosts
+//! use scaled integers or decimal strings. Do not remove that guard: `tests/canonical.rs` pins
+//! both the rule and the `serde_json` behaviour that motivates it.
 
 use crate::error::Result;
 use serde::{Serialize, de::DeserializeOwned};
@@ -68,10 +73,36 @@ pub fn canonicalize(value: &Value) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
 }
 
+/// Counts bytes written and discards them.
+///
+/// Exists so [`encoded_len`] can measure without materialising the buffer.
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The canonical byte length of a value, without keeping the bytes.
+///
+/// Streams into a counting sink rather than building the encoded buffer. That matters on the
+/// path this is used for: [`crate::PushRequest::validate`] measures a request against a 1 MB
+/// budget, and 256 maximum-size payloads would otherwise allocate roughly 16 MB purely in order
+/// to decide to reject them.
 ///
 /// # Errors
 /// Returns an error if the value cannot be encoded.
 pub fn encoded_len<T: Serialize>(value: &T) -> Result<usize> {
-    Ok(to_vec(value)?.len())
+    // Still through `Value` first, so the measured length is the *canonical* length rather than
+    // the declaration-order one. See the module docs.
+    let v = serde_json::to_value(value)?;
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, &v)?;
+    Ok(counter.0)
 }

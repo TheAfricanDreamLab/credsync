@@ -53,6 +53,7 @@ truncation converts hostile input into a silently wrong value.
 | `entity` | string | 64 bytes, `[a-z0-9_]` |
 | `entity_id` | string | 64 bytes |
 | `seq`, `next_cursor`, `server_seq` | uint64 | 1..=2^63-1 |
+| `cursor`, `after` | uint64 | 0..=2^63-1; 0 means "from the beginning" |
 | `op` | enum | `upsert` \| `delete` |
 | `snapshot` | object | 256 KB uncompressed; absent when `op = delete`; no floats (§2.2) |
 | `row_version` | uint64 | 1..=2^63-1 |
@@ -64,9 +65,10 @@ truncation converts hostile input into a silently wrong value.
 | `payload` | object | 64 KB uncompressed; no floats (§2.2) |
 | `client_ts` | int64 | Unix ms; advisory only |
 | `status` | enum | `applied` \| `rejected` \| `superseded` |
-| `reason` | string | 256 bytes; required when `status = rejected` |
+| `reason` | string | 256 bytes; UTF-8, no control characters; required when `status = rejected` |
 | `limit_bytes` | uint | 1..=1048576; a client hint — the server may return less, never more |
 | `commands[]` | array | 256 entries **and** 1 MB total uncompressed, whichever binds first |
+| `scopes[]` | array | 64 entries per pull request |
 | `batches[]`, `changes[]`, `rows[]`, `results[]` | array | bounded by the byte budget, not by count |
 
 ### 2.2 No floating-point numbers
@@ -87,7 +89,7 @@ is canonical JSON. The rules in §2 apply to bodies.
 
 ### 3.1 Bootstrap — `GET /sync/bootstrap`
 
-```
+```http
 request:  ?protocol=1&scope=s1&after=0     # `after` resumes a partial bootstrap
 response: { protocol: 1, scope: 's1', rows: [ { entity, entity_id, snapshot,
             row_version, schema_version } ], next_cursor, has_more,
@@ -101,7 +103,7 @@ joining the log there neither loses nor double-applies a concurrent write.
 
 ### 3.2 Pull — `GET /sync/pull`
 
-```
+```http
 request:  ?protocol=1&scopes=s1:cursor1,s2:cursor2&limit_bytes=100000
 response: { protocol: 1, batches: [ { scope, changes: [ { seq, entity, entity_id, op,
             snapshot, row_version, schema_version } ], next_cursor, has_more,
@@ -112,7 +114,7 @@ response: { protocol: 1, batches: [ { scope, changes: [ { seq, entity, entity_id
 
 ### 3.3 Push — `POST /sync/push`
 
-```
+```http
 request:  { protocol: 1, commands: [ { id, name, scope, payload, client_ts, checksum } ] }
 response: { protocol: 1, results: [ { id, status, reason?, server_seq? } ] }
 ```

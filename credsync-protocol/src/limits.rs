@@ -55,6 +55,12 @@ pub const COMMANDS_MAX_COUNT: usize = 256;
 /// `commands[]`: 1 MB total canonical bytes per push request, whichever binds first.
 pub const COMMANDS_MAX_TOTAL_BYTES: usize = 1024 * 1024;
 
+/// `scopes[]`: 64 entries per pull request.
+///
+/// A client syncs a handful of scopes, not hundreds. Leaving the list unbounded would let one
+/// request fan out into arbitrarily many change-log queries.
+pub const SCOPES_MAX_COUNT: usize = 64;
+
 /// `seq`, `next_cursor`, `server_seq`, `row_version`: 1..=2^63-1.
 ///
 /// Capped at [`i64::MAX`] rather than [`u64::MAX`] because the change log's `seq` is a Postgres

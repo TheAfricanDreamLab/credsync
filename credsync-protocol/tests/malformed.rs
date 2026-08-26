@@ -171,3 +171,81 @@ fn numeric_overflow_is_refused() {
     // A float where an integer is required.
     assert!(canonical::from_slice::<credsync_protocol::Seq>(b"1.5").is_err());
 }
+
+/// Host-document rules must hold on the **decode** path, not just in the constructors.
+///
+/// A rule enforced only by `Snapshot::new` is a rule an attacker skips by sending JSON: the
+/// decoder is the surface that actually faces the network.
+#[test]
+fn host_document_rules_hold_when_decoding() {
+    // A float inside a snapshot, arriving as wire bytes.
+    let with_float = br#"{"seq":1,"entity":"lessons","entity_id":"a","op":"upsert",
+        "snapshot":{"score":0.5},"row_version":1,"schema_version":1}"#;
+    assert!(
+        canonical::from_slice::<Change>(with_float).is_err(),
+        "a float reached a Snapshot through deserialization"
+    );
+
+    // A non-object snapshot.
+    let scalar = br#"{"seq":1,"entity":"lessons","entity_id":"a","op":"upsert",
+        "snapshot":42,"row_version":1,"schema_version":1}"#;
+    assert!(canonical::from_slice::<Change>(scalar).is_err());
+
+    // An upsert with no snapshot violates the op/snapshot rule and must not decode.
+    let no_snapshot = br#"{"seq":1,"entity":"lessons","entity_id":"a","op":"upsert",
+        "row_version":1,"schema_version":1}"#;
+    assert!(
+        canonical::from_slice::<Change>(no_snapshot).is_err(),
+        "op=upsert without a snapshot decoded successfully"
+    );
+
+    // A tombstone carrying a snapshot likewise.
+    let delete_with_snapshot = br#"{"seq":1,"entity":"lessons","entity_id":"a","op":"delete",
+        "snapshot":{"a":1},"row_version":1,"schema_version":1}"#;
+    assert!(canonical::from_slice::<Change>(delete_with_snapshot).is_err());
+
+    // A valid tombstone still decodes, proving the cases above fail for their stated reason.
+    let ok = br#"{"seq":1,"entity":"lessons","entity_id":"a","op":"delete",
+        "row_version":1,"schema_version":1}"#;
+    assert!(canonical::from_slice::<Change>(ok).is_ok());
+}
+
+/// A rejection without a reason must not decode: it reaches a user as a dead end.
+#[test]
+fn rejected_without_reason_does_not_decode() {
+    let bad = br#"{"id":"0190f8c1-2a3b-7c4d-8e5f-60718293a4b5","status":"rejected"}"#;
+    assert!(
+        canonical::from_slice::<CommandResult>(bad).is_err(),
+        "a rejection with no reason decoded successfully"
+    );
+
+    let good = br#"{"id":"0190f8c1-2a3b-7c4d-8e5f-60718293a4b5","status":"rejected",
+        "reason":"deadline passed"}"#;
+    assert!(canonical::from_slice::<CommandResult>(good).is_ok());
+}
+
+/// Out-of-order changes must not decode: ordering is a wire invariant, not a convention.
+#[test]
+fn misordered_batch_does_not_decode() {
+    let change = |seq: u64| {
+        format!(
+            r#"{{"seq":{seq},"entity":"l","entity_id":"a","op":"delete","row_version":1,"schema_version":1}}"#
+        )
+    };
+    let body = |a: u64, b: u64| {
+        format!(
+            r#"{{"scope":"s","changes":[{},{}],"next_cursor":0,"has_more":false,"checksum":"ab","digest":"cd"}}"#,
+            change(a),
+            change(b)
+        )
+    };
+    assert!(
+        canonical::from_slice::<Batch>(body(2, 1).as_bytes()).is_err(),
+        "a descending batch decoded successfully"
+    );
+    assert!(
+        canonical::from_slice::<Batch>(body(1, 1).as_bytes()).is_err(),
+        "a batch with a repeated seq decoded successfully"
+    );
+    assert!(canonical::from_slice::<Batch>(body(1, 2).as_bytes()).is_ok());
+}
