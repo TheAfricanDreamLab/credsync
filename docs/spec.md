@@ -153,10 +153,10 @@ response: { protocol: 1, results: [ { id, status, reason?, server_seq? } ] }
 - **A digest mismatch means silent divergence.** The client marks the scope tainted,
   re-bootstraps, replays its own outbox, and emits telemetry carrying *both* digests. A tainted scope does not block others.
 
-**Algorithms**, truncated to 128 bits. Checksums and digests use **xxh3**: they ask "is this intact"
-on a channel TLS already protects, run per batch and per row on a battery-powered phone, and
-benchmark 4.6x faster. Command checksums use **BLAKE3** — refusing a *mutated* replay is a promise
-no non-cryptographic hash makes.
+**Algorithms**, both truncated to 128 bits. *Batch checksums and scope digests* use **xxh3**: they
+ask "is this intact" on a channel TLS already protects, run per batch and per row on a
+battery-powered phone, and benchmark 4.6x faster. *Command payload checksums* use **BLAKE3**:
+refusing a mutated replay is a promise no non-cryptographic hash makes.
 
 ## 6. Conflict classes
 

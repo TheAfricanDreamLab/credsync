@@ -68,24 +68,35 @@ boundary!(
     limits::REASON_MAX_BYTES,
     'a'
 );
-/// Hex needs its own boundary case: `HEX_MAX_CHARS + 1` is odd, so the generic macro would have
-/// asserted `TooLong` against a value actually refused for having an odd length - passing for the
-/// wrong reason. The over-limit value here is even, so length is genuinely what refuses it.
+/// The hex width is exact, not a ceiling: both algorithms are 128-bit (D-031), so 31, 34 and 64
+/// characters are all malformed even though two of them are even and all three are valid hex.
+///
+/// This replaces an earlier ceiling test that used `HEX_MAX_CHARS + 1` — an odd number, so it was
+/// refused for odd length while asserting `TooLong`, and passed for the wrong reason.
 #[test]
-fn hex_at_and_over_limit() {
-    let at_limit: String = std::iter::repeat_n('a', limits::HEX_MAX_CHARS).collect();
+fn hex_width_is_exact() {
+    let hex_of = |n: usize| -> String { std::iter::repeat_n('a', n).collect() };
+
     assert!(
-        HexString::new(at_limit).is_ok(),
-        "the legal maximum was rejected"
+        HexString::new(hex_of(limits::HEX_CHARS)).is_ok(),
+        "the declared width was rejected"
     );
 
-    let over: String = std::iter::repeat_n('a', limits::HEX_MAX_CHARS + 2).collect();
-    assert_eq!(over.len() % 2, 0, "the over-limit value must be even");
-    let err = HexString::new(over).expect_err("oversize hex accepted");
-    assert!(
-        matches!(err, ProtocolError::TooLong { .. }),
-        "expected TooLong, got {err:?}"
-    );
+    for short in [2usize, 30, 31] {
+        assert!(
+            matches!(
+                HexString::new(hex_of(short)),
+                Err(ProtocolError::TooShort { .. })
+            ),
+            "accepted {short} characters"
+        );
+    }
+    for long in [33usize, 34, 64] {
+        assert!(
+            HexString::new(hex_of(long)).is_err(),
+            "accepted {long} characters"
+        );
+    }
 }
 
 #[test]
@@ -114,15 +125,16 @@ fn charsets_are_enforced() {
         EntityName::new("Lessons"),
         Err(ProtocolError::BadCharset { .. })
     ));
-    // Uppercase hex encodes the same bytes but is a different string.
+    // Uppercase hex encodes the same bytes but is a different string, so it would break
+    // byte-stability. Checked at the full width, since a short value is refused for length first.
     assert!(matches!(
-        HexString::new("AABB"),
+        HexString::new(format!("{}AA", "a".repeat(30))),
         Err(ProtocolError::BadCharset { .. })
     ));
-    // Hex encodes whole bytes, so an odd length is malformed.
+    // The old odd-length rule is subsumed by the exact width: an odd count cannot equal 32.
     assert!(matches!(
         HexString::new("abc"),
-        Err(ProtocolError::BadCharset { .. })
+        Err(ProtocolError::TooShort { .. })
     ));
     // Control characters must not reach a log or a terminal.
     assert!(matches!(
@@ -377,11 +389,12 @@ fn pull_request_bounds_its_scope_list() {
 /// field name is a parameter - an error naming the wrong field sends a reader to the wrong place.
 #[test]
 fn hex_errors_name_the_field_they_came_from() {
-    match HexString::new_named("checksum", "zz") {
+    let bad_charset = format!("{}z", "a".repeat(31));
+    match HexString::new_named("checksum", bad_charset.clone()) {
         Err(ProtocolError::BadCharset { field, .. }) => assert_eq!(field, "checksum"),
         other => panic!("expected BadCharset for checksum, got {other:?}"),
     }
-    match HexString::new("zz") {
+    match HexString::new(bad_charset) {
         Err(ProtocolError::BadCharset { field, .. }) => assert_eq!(field, "digest"),
         other => panic!("expected BadCharset for digest, got {other:?}"),
     }

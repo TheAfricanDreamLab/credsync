@@ -186,11 +186,11 @@ impl core::fmt::Display for Reason {
     }
 }
 
-/// A batch checksum or scope digest: lowercase hex, at most 64 characters.
+/// A batch checksum or scope digest: exactly 32 lowercase hex characters.
 ///
-/// The exact width is fixed by the algorithm chosen at CS-4 (`DECISIONS.md` O-001), so this
-/// type enforces the bound and the alphabet rather than a specific length. An odd number of
-/// characters is refused: hex encodes whole bytes.
+/// Both algorithms are truncated to 128 bits (`DECISIONS.md` D-031), so the width is exact
+/// rather than bounded. Enforcing it here means the decoder cannot accept a two-character
+/// checksum that no producer would ever emit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct HexString(String);
@@ -202,8 +202,7 @@ impl HexString {
     /// actually supplied.
     ///
     /// # Errors
-    /// Returns an error if the value is empty, longer than 64 characters, contains anything
-    /// other than `0-9a-f`, or has an odd length.
+    /// Returns an error unless the value is exactly 32 lowercase hex characters.
     pub fn new(s: impl Into<String>) -> Result<Self> {
         Self::new_named("digest", s)
     }
@@ -218,17 +217,14 @@ impl HexString {
     /// As [`HexString::new`], with `field` used in the reported error.
     pub fn new_named(field: &'static str, s: impl Into<String>) -> Result<Self> {
         let s = s.into();
-        checked(
-            field,
-            "lowercase hex",
-            limits::HEX_MAX_CHARS,
-            is_lower_hex,
-            &s,
-        )?;
-        if s.len() % 2 != 0 {
-            return Err(ProtocolError::BadCharset {
+        checked(field, "lowercase hex", limits::HEX_CHARS, is_lower_hex, &s)?;
+        // `checked` refuses anything longer; this refuses anything shorter. Together they pin
+        // the width exactly, which is what the specification declares.
+        if s.len() != limits::HEX_CHARS {
+            return Err(ProtocolError::TooShort {
                 field,
-                expected: "an even number of hex characters",
+                expected: limits::HEX_CHARS,
+                actual: s.len(),
             });
         }
         Ok(Self(s))

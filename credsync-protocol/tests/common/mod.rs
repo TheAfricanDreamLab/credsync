@@ -38,7 +38,8 @@ pub fn reason() -> impl Strategy<Value = Reason> {
 }
 
 pub fn hex() -> impl Strategy<Value = HexString> {
-    "([0-9a-f]{2}){1,32}".prop_filter_map("valid hex", |s| HexString::new(s).ok())
+    // Exactly 32 characters: the width is fixed, not bounded (D-031).
+    "[0-9a-f]{32}".prop_filter_map("valid hex", |s| HexString::new(s).ok())
 }
 
 pub fn command_id() -> impl Strategy<Value = CommandId> {

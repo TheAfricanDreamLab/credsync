@@ -16,12 +16,10 @@
 //! with the same memory bandwidth and SIMD width, and the ratio is what decides the tradeoff.
 //! A phone will be slower at both, in roughly the same proportion.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::print_stdout
-)]
+// A benchmark's entire output is stdout, so `print_stdout` is allowed here and only here.
+// The panic-family lints are NOT bypassed: this is non-test code and must earn the same
+// treatment as the rest of the crate.
+#![allow(clippy::print_stdout)]
 
 use std::time::Instant;
 use twox_hash::XxHash3_128;
@@ -100,5 +98,7 @@ fn throughput(iters: usize, size: usize, mut f: impl FnMut()) -> f64 {
         *run = (size * iters) as f64 / elapsed / (1024.0 * 1024.0);
     }
     runs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    runs[1]
+    // Index 1 of a fixed-size [f64; 3] is the median. `get` rather than indexing so the
+    // panic-family lints stay honest even here.
+    runs.get(1).copied().unwrap_or(0.0)
 }

@@ -234,7 +234,7 @@ fn misordered_batch_does_not_decode() {
     };
     let body = |a: u64, b: u64| {
         format!(
-            r#"{{"scope":"s","changes":[{},{}],"next_cursor":0,"has_more":false,"checksum":"ab","digest":"cd"}}"#,
+            r#"{{"scope":"s","changes":[{},{}],"next_cursor":0,"has_more":false,"checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
             change(a),
             change(b)
         )
@@ -266,7 +266,7 @@ fn collection_bounds_apply_during_deserialization() {
     use credsync_protocol::limits;
 
     let cmd = r#"{"id":"0190f8c1-2a3b-7c4d-8e5f-60718293a4b5","name":"submit","scope":"s",
-        "payload":{},"client_ts":0,"checksum":"ab"}"#;
+        "payload":{},"client_ts":0,"checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
 
     let push = |n: usize, tail: &str| {
         let mut items: Vec<String> = (0..n).map(|_| cmd.to_string()).collect();

@@ -30,6 +30,15 @@ pub enum ProtocolError {
         /// The field at fault.
         field: &'static str,
     },
+    /// A fixed-width field was shorter than its declared width.
+    TooShort {
+        /// The field at fault.
+        field: &'static str,
+        /// The exact width the specification declares.
+        expected: usize,
+        /// The length actually supplied.
+        actual: usize,
+    },
     /// A numeric field fell outside its declared range.
     OutOfRange {
         /// The field at fault.
@@ -91,6 +100,14 @@ impl fmt::Display for ProtocolError {
                 write!(f, "{field}: expected {expected}")
             }
             Self::Empty { field } => write!(f, "{field}: must not be empty"),
+            Self::TooShort {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{field}: {actual} characters, expected exactly {expected}"
+            ),
             Self::OutOfRange {
                 field,
                 min,

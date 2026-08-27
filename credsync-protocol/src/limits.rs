@@ -28,11 +28,12 @@ pub const COMMAND_NAME_MAX_BYTES: usize = 64;
 /// `reason`: 256 bytes.
 pub const REASON_MAX_BYTES: usize = 256;
 
-/// `digest` and `checksum`: at most 64 lowercase hex characters.
+/// `digest` and `checksum`: exactly 32 lowercase hex characters, i.e. 128 bits.
 ///
-/// The exact width is fixed by the algorithm chosen at CS-4 (`DECISIONS.md` O-001). Until then
-/// the codec enforces the bound and the character set, not a specific width.
-pub const HEX_MAX_CHARS: usize = 64;
+/// An exact width, not a ceiling. O-001 is closed (`DECISIONS.md` D-031) and both algorithms are
+/// truncated to 128 bits, so any other length is malformed rather than merely unusual. A ceiling
+/// would let a two-character checksum through the decoder while every producer emits 32.
+pub const HEX_CHARS: usize = 32;
 
 /// `snapshot`: 256 KB of canonical encoding.
 pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;

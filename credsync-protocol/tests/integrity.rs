@@ -281,3 +281,73 @@ fn corruption_and_tamper_checksums_are_distinct() {
         "xxh3 and BLAKE3 produced the same value - one of them is not being used"
     );
 }
+
+/// Fixed vectors, pinning that these are *real* xxh3 and BLAKE3 rather than merely
+/// self-consistent functions.
+///
+/// Every property test above compares our output against our own output. All of them would keep
+/// passing if a dependency bump silently changed the algorithm, if a feature flag switched xxh3's
+/// seed, or if the BLAKE3 truncation moved from the first 16 bytes to the last. Two sides running
+/// different credSync versions would then disagree on every digest — the divergence detector
+/// causing divergence.
+///
+/// These values were produced by this implementation and are now frozen. If one changes, the wire
+/// format changed: that is a protocol break requiring a version bump, not a fixture update.
+#[test]
+fn checksum_vectors_are_frozen() {
+    const CASES: &[(&[u8], &str, &str)] = &[
+        // The empty-input rows are checkable against the algorithms' own published vectors:
+        // XXH3-128("") and BLAKE3("") truncated to 16 bytes. If these two match, the crates are
+        // computing real xxh3 and real BLAKE3 rather than something merely deterministic.
+        (
+            b"",
+            "99aa06d3014798d86001c324468d497f",
+            "af1349b9f5f9a1a6a0404dea36dcc949",
+        ),
+        (
+            b"a",
+            "a96faf705af16834e6c632b61e964e1f",
+            "17762fddd969a453925d65717ac3eea2",
+        ),
+        (
+            b"credsync",
+            "254b202a78f16d981d7372cfbc385c64",
+            "73ad155816af6db8ea75cd5ce99da282",
+        ),
+    ];
+    for (input, want_xxh3, want_blake3) in CASES {
+        assert_eq!(
+            checksum_bytes(input).as_str(),
+            *want_xxh3,
+            "xxh3 vector changed for {input:?} - the wire format moved"
+        );
+        assert_eq!(
+            payload_checksum_bytes(input).as_str(),
+            *want_blake3,
+            "BLAKE3 vector changed for {input:?} - the wire format moved"
+        );
+    }
+}
+
+/// The empty scope digest is the additive identity, and must stay that value on the wire.
+#[test]
+fn empty_digest_vector_is_frozen() {
+    assert_eq!(ScopeDigest::EMPTY.to_hex().as_str(), "0".repeat(32));
+}
+
+/// A known row produces a known digest. Pins the row-hash construction — the length prefixes,
+/// the big-endian row_version, and the field order — all of which are wire format.
+#[test]
+fn row_digest_vector_is_frozen() {
+    let mut d = ScopeDigest::EMPTY;
+    d.add(
+        &EntityName::new("lessons").expect("valid"),
+        &EntityId::new("l1").expect("valid"),
+        RowVersion::new(1).expect("valid"),
+    );
+    assert_eq!(
+        d.to_hex().as_str(),
+        "895b94cd12efa8346b73a3122de3edb8",
+        "the row-hash construction changed - this is a protocol break"
+    );
+}

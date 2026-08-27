@@ -79,6 +79,8 @@ stale entry fails the build rather than quietly misleading a session.
 | D-032 | **The scope digest sums per-row hashes in wrapping `u128`, rather than XORing them.** Addition is commutative so order cannot matter, and has an exact inverse so a tombstone restores the digest to precisely its prior value. XOR has both properties too, and is the obvious choice, but it is self-inverse: two identical rows cancel, so a bug that duplicated a row would produce the digest of a scope where the row is absent - and the mechanism whose entire purpose is noticing silent divergence would report agreement. Row fields are length-prefixed for the same reason: without that, `("lesson","a1")` and `("lessona","1")` collide. | This slice (CS-4) | 27 Aug 2026 |
 | D-033 | **`twox-hash` rather than `xxhash-rust` for xxh3.** `xxhash-rust` is BSL-1.0, outside the allowlist in `deny.toml`; `twox-hash` is MIT. The licence gate chose the crate, which is the gate working as intended (D-011). | This slice (CS-4) | 27 Aug 2026 |
 
+| D-034 | **`digest` and `checksum` are exactly 32 hex characters, not at most 64.** With O-001 closed the width is decided, so any other length is malformed rather than merely unusual. Enforcing a ceiling instead would let a two-character checksum through the decoder while every producer emits 32 — a gap between what the spec declares and what the wire accepts. Found by review at CS-4, in a divergence introduced by CS-4 itself. | This slice (CS-4); D-031 | 27 Aug 2026 |
+
 ## Open — decided at a named slice
 
 These are deliberately unresolved. Each has an owning slice; none may be settled informally.
