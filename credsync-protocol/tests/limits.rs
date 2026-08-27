@@ -426,3 +426,63 @@ fn reason_accepts_utf8_but_not_control_characters() {
         Err(ProtocolError::TooLong { .. })
     ));
 }
+
+/// The `TooShort` diagnostic must carry usable detail, not just the right variant.
+///
+/// A test that only matches the variant would keep passing if `expected` and `actual` were
+/// swapped, or if the field name were wrong — and those numbers are what someone debugging a
+/// rejected checksum at 2am actually reads.
+#[test]
+fn too_short_reports_field_expected_and_actual() {
+    let short = "a".repeat(30);
+
+    match HexString::new_named("checksum", short.clone()) {
+        Err(ProtocolError::TooShort {
+            field,
+            expected,
+            actual,
+        }) => {
+            assert_eq!(field, "checksum");
+            assert_eq!(expected, limits::HEX_CHARS);
+            assert_eq!(actual, 30);
+        }
+        other => panic!("expected TooShort, got {other:?}"),
+    }
+
+    match HexString::new(short) {
+        Err(ProtocolError::TooShort { field, .. }) => assert_eq!(field, "digest"),
+        other => panic!("expected TooShort for digest, got {other:?}"),
+    }
+}
+
+/// The rendered message, pinned. `Display` is what reaches a log or a dead-letter entry, so its
+/// wording is part of the contract rather than an implementation detail.
+#[test]
+fn too_short_display_is_stable() {
+    let err = HexString::new_named("checksum", "a".repeat(31))
+        .expect_err("31 characters should be refused");
+    assert_eq!(
+        err.to_string(),
+        "checksum: 31 characters, expected exactly 32"
+    );
+
+    let err = HexString::new("ab").expect_err("2 characters should be refused");
+    assert_eq!(err.to_string(), "digest: 2 characters, expected exactly 32");
+}
+
+/// Over-width values report `TooLong` with the same detail, so the two directions are symmetric.
+#[test]
+fn too_long_reports_field_limit_and_actual() {
+    match HexString::new_named("digest", "a".repeat(64)) {
+        Err(ProtocolError::TooLong {
+            field,
+            limit,
+            actual,
+        }) => {
+            assert_eq!(field, "digest");
+            assert_eq!(limit, limits::HEX_CHARS);
+            assert_eq!(actual, 64);
+        }
+        other => panic!("expected TooLong, got {other:?}"),
+    }
+}
