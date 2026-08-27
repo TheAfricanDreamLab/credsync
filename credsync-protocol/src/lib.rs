@@ -24,7 +24,7 @@
 //!
 //! # Status
 //!
-//! Types and codec landed at CS-3. Checksums and digests arrive at CS-4, golden fixtures at CS-5.
+//! Types and codec landed at CS-3, checksums and digests at CS-4. Golden fixtures arrive at CS-5.
 //!
 //! [`docs/spec.md`]: https://github.com/TheAfricanDreamLab/credsync/blob/main/docs/spec.md
 
@@ -33,6 +33,7 @@
 pub mod canonical;
 pub mod error;
 pub mod ids;
+pub mod integrity;
 pub mod limits;
 pub mod nums;
 mod validated;
@@ -40,6 +41,9 @@ pub mod wire;
 
 pub use error::{ProtocolError, Result};
 pub use ids::{CommandId, CommandName, EntityId, EntityName, HexString, Reason, ScopeId};
+pub use integrity::{
+    ScopeDigest, checksum, checksum_bytes, payload_checksum, payload_checksum_bytes,
+};
 pub use nums::{Cursor, LimitBytes, ProtocolVersion, RowVersion, SchemaVersion, Seq};
 pub use wire::{
     Batch, BootstrapRequest, BootstrapResponse, BootstrapRow, Change, Command, CommandResult,

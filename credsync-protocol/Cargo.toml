@@ -18,5 +18,14 @@ workspace = true
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# xxh3 for batch checksums and scope digests. twox-hash rather than xxhash-rust: the latter is
+# BSL-1.0, which is outside the licence allowlist in deny.toml (DECISIONS.md D-011). The gate
+# chose the crate.
+twox-hash  = { version = "2", default-features = false, features = ["xxhash3_128"] }
+
+# BLAKE3 for the command payload checksum, where tamper-evidence matters rather than raw speed.
+# Design v2.1 section 5.1 draws exactly this line.
+blake3     = { version = "1", default-features = false }
+
 [dev-dependencies]
 proptest = "1"

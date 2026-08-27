@@ -58,7 +58,7 @@ truncation converts hostile input into a silently wrong value.
 | `snapshot` | object | 256 KB uncompressed; absent when `op = delete`; no floats (§2.2) |
 | `row_version` | uint64 | 1..=2^63-1 |
 | `schema_version` | uint | 1..=65535 |
-| `digest`, `checksum` | lowercase hex | ≤64 chars; exact width fixed by the algorithm chosen at CS-4 |
+| `digest`, `checksum` | lowercase hex | exactly 32 chars (128-bit), fixed width including leading zeros |
 | `has_more` | bool | — |
 | `id` (command) | UUIDv7 | 16 bytes |
 | `name` (command) | string | 64 bytes, `[a-z0-9_]` |
@@ -76,9 +76,9 @@ truncation converts hostile input into a silently wrong value.
 **`snapshot` and `payload` contain no floats, at any depth.** A float is refused, not coerced.
 
 JSON float parsing is not exact in practice: a value can re-parse one ULP from what was written,
-then re-encode shorter. Such a document does not survive a serialize/parse/serialize cycle
-unchanged — so two sides holding the same row would compute different digests (§5) and the client
-would re-bootstrap against a divergence that never happened, the detector firing on itself.
+then re-encode shorter. Such a document survives no serialize/parse/serialize cycle intact, so two
+sides holding the same row compute different digests (§5) and the client re-bootstraps against a
+divergence that never happened — the detector firing on itself.
 
 Use scaled integers or decimal strings. Both are exact, and portable where JSON floats are not.
 
@@ -151,11 +151,12 @@ response: { protocol: 1, results: [ { id, status, reason?, server_seq? } ] }
   individually equals applying them as a batch — and a tombstone leaves the digest as though the
   row had never existed.
 - **A digest mismatch means silent divergence.** The client marks the scope tainted,
-  re-bootstraps, replays its own outbox, and emits telemetry carrying *both* digests. A tainted
-  scope does not block other scopes. Self-healing plus a signal, instead of quiet rot.
+  re-bootstraps, replays its own outbox, and emits telemetry carrying *both* digests. A tainted scope does not block others.
 
-> Algorithm is **pending — decided at CS-4** by benchmark on target-class hardware: xxh3 for
-> speed against BLAKE3 where tamper-evidence matters (`DECISIONS.md` O-001).
+**Algorithms**, both truncated to 128 bits. *Batch checksums and scope digests* use **xxh3**: they
+ask "is this intact" on a channel TLS already protects, run per batch and per row on a
+battery-powered phone, and benchmark 4.6x faster. *Command payload checksums* use **BLAKE3**:
+refusing a mutated replay is a promise no non-cryptographic hash makes.
 
 ## 6. Conflict classes
 
