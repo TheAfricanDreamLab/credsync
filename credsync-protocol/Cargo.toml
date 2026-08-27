@@ -6,10 +6,17 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
-repository.workspace   = true
+repository.workspace    = true
 homepage.workspace     = true
 
 [lints]
 workspace = true
 
 [dependencies]
+# serde_json's Map is a BTreeMap unless `preserve_order` is enabled, which is exactly what
+# canonical encoding needs: object keys sort on serialize. Do NOT enable `preserve_order`.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+proptest = "1"
