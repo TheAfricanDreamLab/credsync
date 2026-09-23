@@ -1,7 +1,7 @@
 //! The fault menu. Design v2.1 §7.1.
 //!
 //! Everything the world is allowed to do to a device, and how often. Each fault is drawn from the
-//! seeded [`Rng`](crate::rng::Rng) and nothing else, so a run is a pure function of its seed.
+//! seeded [`Rng`] and nothing else, so a run is a pure function of its seed.
 //!
 //! # Probabilities are deliberately hostile
 //!
