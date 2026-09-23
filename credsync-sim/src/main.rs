@@ -58,7 +58,31 @@ fn run_one(seed: u64, trace_wanted: bool) -> ExitCode {
         human_duration(world.elapsed_ms()),
         world.trace.coverage()
     );
-    ExitCode::SUCCESS
+
+    if world.invariants.holds() {
+        ExitCode::SUCCESS
+    } else {
+        report(seed, world.invariants.violations());
+        ExitCode::FAILURE
+    }
+}
+
+/// Prints a violation report, seed first.
+///
+/// The seed is the whole reproduction, so it goes at the top and again at the bottom as a
+/// runnable command. Someone reading a CI log at speed should be able to copy one line.
+fn report(seed: u64, violations: &[credsync_sim::Violation]) {
+    eprintln!();
+    eprintln!("FAILED at seed 0x{seed:016x}");
+    for v in violations.iter().take(20) {
+        eprintln!("  {v}");
+    }
+    if violations.len() > 20 {
+        eprintln!("  ... and {} more", violations.len() - 20);
+    }
+    eprintln!();
+    eprintln!("replay it exactly:");
+    eprintln!("  cargo run --release -p credsync-sim -- --seed 0x{seed:x} --trace");
 }
 
 /// Runs a batch, reporting aggregate fault coverage.
@@ -80,6 +104,14 @@ fn run_batch(seeds: u64) -> ExitCode {
 
         for (name, n) in world.trace.faults() {
             *totals.entry(name).or_insert(0) += n;
+        }
+
+        // Stop at the first failure rather than pressing on. The seed is the reproduction, and a
+        // batch that carried on would bury it under hundreds of later lines.
+        if !world.invariants.holds() {
+            println!("{}/{seeds} seeds green, then:", seed);
+            report(seed, world.invariants.violations());
+            return ExitCode::FAILURE;
         }
     }
 
