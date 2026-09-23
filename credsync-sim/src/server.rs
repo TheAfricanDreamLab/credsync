@@ -199,6 +199,28 @@ impl Server {
         latest.into_iter().map(|((e, i), v)| (e, i, v)).collect()
     }
 
+    /// The version a row should hold on a client whose cursor is at `cursor`.
+    ///
+    /// The latest change to that row at or below the cursor — exactly what a correct client ends
+    /// up storing, having applied every change in `seq` order.
+    #[must_use]
+    pub fn row_version_at(
+        &self,
+        scope: &ScopeId,
+        entity: &EntityName,
+        entity_id: &EntityId,
+        cursor: u64,
+    ) -> Option<RowVersion> {
+        let indices = self.by_scope.get(scope)?;
+        indices.iter().rev().find_map(|&i| {
+            let e = &self.log[i];
+            (e.seq.get() <= cursor
+                && e.change.entity == *entity
+                && e.change.entity_id == *entity_id)
+                .then_some(e.change.row_version)
+        })
+    }
+
     /// Applies a push, deduping replays and recording every outcome.
     #[must_use]
     pub fn push(&mut self, request: &PushRequest, rng: &mut Rng) -> PushResponse {
