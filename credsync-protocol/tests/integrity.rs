@@ -39,13 +39,14 @@ fn digest_of(rows: &[Row]) -> ScopeDigest {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(common::config(256))]
 
     /// DoD 1a: order-independence, across arbitrary permutations rather than a reversal.
     ///
     /// This is the property that lets two machines which built the same scope in different
     /// orders — a fresh bootstrap versus weeks of incremental pulls — agree.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn digest_is_order_independent(rows in rows(), seed in any::<u64>()) {
         let mut shuffled = rows.clone();
         // A deterministic shuffle driven by the generated seed: no ambient randomness, so a
@@ -68,6 +69,7 @@ proptest! {
     /// whole set does. Without this the client's running digest and the server's freshly computed
     /// one would drift apart and every scope would eventually report a phantom divergence.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn digest_is_incremental(rows in rows()) {
         let mut incremental = ScopeDigest::EMPTY;
         for (entity, entity_id, row_version) in &rows {
@@ -80,6 +82,7 @@ proptest! {
     ///
     /// Exactly, not approximately — `remove` is the true inverse of `add`.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn removing_a_row_is_the_exact_inverse_of_adding_it(rows in rows(), extra in row()) {
         // Skip when the extra row collides with one already present: a scope holds one row per key.
         prop_assume!(!rows.iter().any(|(e, i, _)| *e == extra.0 && *i == extra.1));
@@ -97,6 +100,7 @@ proptest! {
     /// The same row at a different version must produce a different digest, or an edit that only
     /// bumps the version would be invisible to divergence detection.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn digest_is_row_version_sensitive(r in row(), other in common::row_version()) {
         prop_assume!(r.2 != other);
         let mut a = ScopeDigest::EMPTY;
@@ -108,6 +112,7 @@ proptest! {
 
     /// An update is remove-then-add, and lands where a from-scratch computation does.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn update_matches_a_fresh_computation(rows in rows(), to in common::row_version()) {
         prop_assume!(!rows.is_empty());
         let mut updated = rows.clone();
@@ -125,6 +130,7 @@ proptest! {
     /// One flipped bit anywhere in the encoding must change the checksum. This is the whole
     /// promise of "detected before apply, and the batch refetched, never half-applied".
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn checksum_detects_single_bit_corruption(value in common::batch(), bit in any::<u16>()) {
         let bytes = canonical::to_vec(&value).expect("encodes");
         prop_assume!(!bytes.is_empty());
@@ -143,6 +149,7 @@ proptest! {
 
     /// The same, for the tamper-evident command checksum.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn payload_checksum_detects_single_bit_corruption(
         value in common::command(),
         bit in any::<u16>()
@@ -162,6 +169,7 @@ proptest! {
 
     /// A checksum is stable: the same value always produces the same value.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn checksum_is_deterministic(value in common::pull_response()) {
         prop_assert_eq!(
             checksum(&value).expect("checksums"),

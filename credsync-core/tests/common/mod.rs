@@ -17,6 +17,7 @@ use credsync_protocol::{
     EntityName, EntityRegistration, HexString, Op, Payload, ProtocolVersion, PushResponse, Reason,
     RowVersion, SchemaVersion, ScopeDigest, ScopeId, Seq, Snapshot, Status,
 };
+use proptest::prelude::ProptestConfig;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -590,5 +591,33 @@ pub fn superseded(n: u8) -> CommandResult {
         status: Status::Superseded,
         reason: None,
         server_seq: None,
+    }
+}
+
+/// A `proptest` configuration whose case count can be turned up or down from the environment.
+///
+/// `default_cases` is what this suite runs when nothing says otherwise. `PROPTEST_CASES`
+/// overrides it, which is what lets one test suite serve three very different jobs (CS-10):
+///
+/// - **PR CI** runs the default, which is the count these tests have always run at.
+/// - **Nightly** turns it far up, because depth is worth an hour when nobody is waiting.
+/// - **Miri** turns it far down. Miri interprets rather than executes and is roughly two orders
+///   of magnitude slower, so it multiplies against the case count brutally — the default never
+///   finished in over an hour. The Miri job checks for undefined behaviour, not input coverage,
+///   and a handful of cases does that job.
+///
+/// Reading the environment here rather than hardcoding is the whole mechanism. `proptest`'s own
+/// `ProptestConfig::default()` already honours `PROPTEST_CASES`, but an explicit `cases: 256`
+/// silently overrides it — which is exactly what these suites used to do, and why setting the
+/// variable changed nothing at all.
+#[must_use]
+pub fn config(default_cases: u32) -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default_cases);
+    ProptestConfig {
+        cases,
+        ..ProptestConfig::default()
     }
 }

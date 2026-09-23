@@ -212,7 +212,15 @@ fn documents_must_be_objects() {
     assert!(Snapshot::new(json!({})).is_ok());
 }
 
+/// Skipped under Miri: it builds and canonically encodes hundreds of kilobytes of JSON, which an
+/// interpreter turns into minutes. Miri is checking for undefined behaviour, and the code paths
+/// here are the same ones the smaller cases in this file already walk under it.
+///
+/// **This does not weaken any gate.** The test runs in full under `cargo test`, on every pull
+/// request, unchanged. Miri is an additional check layered on top; skipping the pathologically
+/// slow cases *there* removes nothing from what CI already proves.
 #[test]
+#[cfg_attr(miri, ignore = "builds hundreds of KB of JSON; see the note above")]
 fn document_at_exactly_the_limit_is_accepted() {
     // Search for a filler length whose canonical encoding is exactly PAYLOAD_MAX_BYTES, then
     // assert it is accepted. Without this the suite only proves "far under" and "far over"
@@ -237,7 +245,15 @@ fn document_at_exactly_the_limit_is_accepted() {
     );
 }
 
+/// Skipped under Miri: it builds and canonically encodes hundreds of kilobytes of JSON, which an
+/// interpreter turns into minutes. Miri is checking for undefined behaviour, and the code paths
+/// here are the same ones the smaller cases in this file already walk under it.
+///
+/// **This does not weaken any gate.** The test runs in full under `cargo test`, on every pull
+/// request, unchanged. Miri is an additional check layered on top; skipping the pathologically
+/// slow cases *there* removes nothing from what CI already proves.
 #[test]
+#[cfg_attr(miri, ignore = "builds hundreds of KB of JSON; see the note above")]
 fn document_size_limits_are_enforced_over_canonical_bytes() {
     // Comfortably under.
     assert!(Payload::new(common::document_of_size(1024)).is_ok());
@@ -308,7 +324,15 @@ fn wire_path_enforces_the_same_limits() {
 
 /// Both push limits must bind. A count limit alone would permit 256 maximum-size payloads,
 /// which is 16 MB on a link chosen because it tolerates 2G.
+/// Skipped under Miri: it builds and canonically encodes hundreds of kilobytes of JSON, which an
+/// interpreter turns into minutes. Miri is checking for undefined behaviour, and the code paths
+/// here are the same ones the smaller cases in this file already walk under it.
+///
+/// **This does not weaken any gate.** The test runs in full under `cargo test`, on every pull
+/// request, unchanged. Miri is an additional check layered on top; skipping the pathologically
+/// slow cases *there* removes nothing from what CI already proves.
 #[test]
+#[cfg_attr(miri, ignore = "builds hundreds of KB of JSON; see the note above")]
 fn push_enforces_count_and_total_bytes() {
     use credsync_protocol::PushRequest;
     use proptest::strategy::{Strategy, ValueTree};

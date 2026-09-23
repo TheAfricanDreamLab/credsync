@@ -85,6 +85,42 @@ jobs:
       - name: No ambient world in the core's source
         run: ./scripts/check-sans-io.sh
 
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Miri needs nightly, which rust-toolchain.toml deliberately does not pin (D-021 pins the
+      # toolchain the code is *built* with; Miri is a checker, not a build target). Every cargo
+      # call below therefore says `+nightly` explicitly, or it would pick up the pinned 1.98.0
+      # and find no miri at all.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+
+      - name: miri setup
+        run: cargo +nightly miri setup
+
+      # Two environment variables, both load-bearing.
+      #
+      # MIRIFLAGS=-Zmiri-disable-isolation: proptest calls std::env::current_dir() to locate its
+      # failure-persistence file, and Miri's sandbox refuses getcwd. Without this the run aborts
+      # with "unsupported operation" before testing anything - and an aborted gate looks a great
+      # deal like a passing one. The flag relaxes the sandbox, NOT the undefined-behaviour
+      # checking, which is the part being bought here.
+      #
+      # PROPTEST_CASES=2: Miri interprets rather than executes, roughly two orders of magnitude
+      # slower, and that multiplies against the case count. The default 256 did not finish in
+      # over an hour when measured at CS-7. This job is checking for undefined behaviour, not
+      # searching the input space - the nightly job is where depth lives.
+      - name: cargo miri test
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+          PROPTEST_CASES: "2"
+        run: cargo +nightly miri test -p credsync-core -p credsync-protocol
+
   deny:
     name: licences and advisories
     runs-on: ubuntu-latest

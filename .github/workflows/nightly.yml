@@ -1,0 +1,74 @@
+# Nightly depth. The PR workflow proves a change is sound; this one goes looking for what the
+# PR budget could not afford to find.
+#
+# The split exists because the two jobs answer different questions. A pull request asks "does this
+# change break something we already know about", and has a person waiting on the answer. The
+# nightly run asks "is there something here nobody has thought of yet", and has all night.
+#
+# Nothing here is a weaker version of a PR gate. Every count below is *larger* than its PR
+# counterpart, never smaller — weakening a gate is the one forbidden move in this repo
+# (CLAUDE.md section 3), and a nightly job that ran less than CI would be exactly that wearing a
+# disguise.
+name: nightly
+
+on:
+  schedule:
+    # 02:00 UTC daily. Early enough that a failure is waiting at the start of the working day in
+    # West Africa rather than arriving in the middle of it.
+    - cron: "0 2 * * *"
+  # So a deep run can be triggered by hand before a release, without waiting for tomorrow.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  deep-property-tests:
+    name: property tests, deep
+    runs-on: ubuntu-latest
+    # 256 cases take seconds; 4096 take minutes. The ceiling is generous rather than tight, so a
+    # slow run is reported as a slow run rather than silently truncated by a timeout.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Sixteen times the PR count. Every proptest suite in the workspace reads PROPTEST_CASES
+      # through `common::config`, which is what makes one number reach all of them.
+      - name: cargo test, 4096 cases
+        env:
+          PROPTEST_CASES: "4096"
+        run: cargo test --workspace --all-features
+
+  miri-with-properties:
+    name: miri, including the property suites
+    runs-on: ubuntu-latest
+    # Generous on purpose. If this times out, tune the case count -- do not delete the job.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+
+      - name: miri setup
+        run: cargo +nightly miri setup
+
+      # The PR Miri job skips every proptest-generated test, because proptest's regex-backed
+      # string strategies are prohibitively slow under an interpreter -- the cost is in building
+      # the strategy, so even one case is expensive and turning the count down does not help.
+      #
+      # `--include-ignored` runs them anyway, which is affordable here and nowhere else. One case
+      # each: the question is whether any of this drives the dependencies' unsafe code into
+      # undefined behaviour, not how much of the input space gets covered.
+      - name: cargo miri test, property suites included
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+          PROPTEST_CASES: "1"
+        run: cargo +nightly miri test -p credsync-core -p credsync-protocol -- --include-ignored

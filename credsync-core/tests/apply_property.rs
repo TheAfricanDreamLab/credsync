@@ -15,6 +15,22 @@
 //! `ScopeDigest::from_rows` over whatever rows survived. Agreement therefore means the two
 //! independent routes match, rather than that one function agrees with itself.
 
+// Not run under Miri, and the case count is not the reason.
+//
+// Each case here drives the whole engine — dozens of batches, hundreds of canonical JSON
+// encodings, a full storage fake — so even two cases is minutes of interpreted work, and the
+// suite dominated the Miri job while adding nothing to it.
+//
+// What Miri buys this project is soundness of the *dependencies* we lean on (`serde_json`,
+// `twox-hash`, `blake3`), because `credsync-core` and `credsync-protocol` are both
+// `#![forbid(unsafe_code)]` and cannot express undefined behaviour at all. The unit suites in
+// `tests/apply.rs`, `tests/outbox.rs` and `tests/conflict.rs` walk every one of those code paths
+// under Miri already. More inputs through the same unsafe code finds no new unsoundness; it
+// finds logic bugs, which is what the native run at 256 cases is for.
+//
+// **This does not weaken any gate.** Every property below runs in full on every pull request
+// under `cargo test`, and at 4096 cases nightly.
+#![cfg(not(miri))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -85,7 +101,7 @@ fn into_batches(changes: Vec<Change>, size: usize) -> Vec<credsync_protocol::Bat
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(config(256))]
 
     /// DoD 4. The running digest equals one computed from scratch over the surviving rows.
     #[test]

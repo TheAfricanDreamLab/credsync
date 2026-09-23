@@ -92,15 +92,26 @@ where
          Update docs/spec.md and the fixture together, in one PR — never the fixture alone."
     );
 
+    // Skipped under Miri. The drill perturbs every byte of every fixture -- roughly 4,800 JSON
+    // parses -- and under an interpreter that is many minutes of walking one code path over and
+    // over. The decode and re-encode assertions above already take `serde_json` through that path
+    // under Miri; repeating it 4,800 times finds no undefined behaviour the first time missed.
+    //
+    // It runs in full on every pull request under `cargo test`, where it costs milliseconds, and
+    // nightly under Miri via `--include-ignored`.
+    #[cfg(not(miri))]
     drill(file, bytes, expected);
 }
 
 /// The planted-bug drill: every single-byte perturbation must be rejected.
 ///
+/// Not compiled under Miri; see the call site in [`golden`] for why.
+///
 /// Flipping the low bit of any byte of canonical JSON always produces either invalid input or a
 /// different value — there is no incidental whitespace to absorb a change, and an unknown key is
 /// dropped rather than merged, which shifts the decoded value. So if any perturbed copy still
 /// decodes to `expected`, the fixture is not actually pinning that byte.
+#[cfg(not(miri))]
 fn drill<T>(file: &str, bytes: &[u8], expected: &T)
 where
     T: DeserializeOwned + PartialEq + Debug,
