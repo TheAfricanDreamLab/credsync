@@ -90,6 +90,31 @@ The network is adversarial. Test accordingly.
 - **Round-trip property test** for every type — `proptest`, not examples.
 - **Golden fixtures** catch what round-trips cannot: a round-trip test still passes if you change
   both the encoder and decoder in the same wrong way. Fixtures pin the actual bytes.
+
+### Working with the fixtures (CS-5)
+
+They live in `credsync-protocol/tests/fixtures/`, one `.json` per wire type, asserted by
+`tests/fixtures.rs`. Four things about them are deliberate and easy to undo by accident:
+
+- **A fixture file is the exact wire bytes — no trailing newline.** The suite asserts this,
+  because a file that merely looks right in an editor is not the thing being pinned. If your
+  editor adds one on save, strip it.
+- **Both directions are asserted.** The bytes must decode to the expected value *and* the
+  expected value must re-encode to those bytes. Only the second catches a renamed or reordered
+  field; only the first catches a decoder that has started reading something else.
+- **There is no regeneration script, on purpose** (D-036). A failing fixture is a report that the
+  wire moved. Confirm that was intended, then update `spec.md` and the fixture in the same PR.
+  Regenerating until the test goes quiet destroys the only signal you had.
+- **Every byte is drilled on every run.** Each fixture's bytes are perturbed one at a time and
+  every perturbation must be rejected, so a fixture cannot silently stop pinning the field it
+  was written for.
+
+Adding a wire type means adding a fixture: `every_fixture_file_is_asserted` catches an orphan
+file, but nothing catches a type you never wrote one for except this sentence.
+
+A fixture carrying an optional field needs **two** files — present and absent — or
+`skip_serializing_if` is unpinned in one direction. `change_upsert.json` / `change_delete.json`
+and `pull_request.json` / `pull_request_no_limit.json` are the worked examples.
 - **Fuzz every decoder** (`cargo-fuzz`, CS-29). Decoders must reject malformed and truncated
   input without panicking. A panic in a decoder is a remote crash.
 - **Test at the size limits**, not just inside them: at the limit, one byte over, empty, and
