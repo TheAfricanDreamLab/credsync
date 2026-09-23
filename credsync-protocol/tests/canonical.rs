@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 proptest! {
     /// Encoding the same value repeatedly yields identical bytes.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn encoding_is_deterministic(value in common::batch()) {
         let a = canonical::to_vec(&value).expect("encodes");
         let b = canonical::to_vec(&value).expect("encodes");
@@ -26,6 +27,7 @@ proptest! {
 
     /// Object keys come out sorted at every level of nesting.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn keys_sort_recursively(doc in common::json_object()) {
         let bytes = canonical::canonicalize(&doc).expect("encodes");
         let text = String::from_utf8(bytes).expect("utf-8");
@@ -34,6 +36,7 @@ proptest! {
 
     /// The encoding carries no incidental whitespace.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn no_incidental_whitespace(value in common::push_request()) {
         let bytes = canonical::to_vec(&value).expect("encodes");
         let text = String::from_utf8(bytes).expect("utf-8");
@@ -51,6 +54,7 @@ proptest! {
     /// documents (D-028): with a float present this test fails, because `serde_json` parsing is
     /// not exact and the value shifts by one ULP across the cycle.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn host_documents_re_encode_identically(doc in common::json_value()) {
         let once = canonical::canonicalize(&doc).expect("encodes");
         let parsed: Value = serde_json::from_slice(&once).expect("decodes");

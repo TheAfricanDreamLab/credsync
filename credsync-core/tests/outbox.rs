@@ -146,7 +146,18 @@ fn one_oversized_command_is_sent_alone_rather_than_wedging_the_outbox() {
     assert_eq!(push.commands[0].id, command_id(1));
 }
 
+/// Skipped under Miri: 258 commands, each canonically encoded as the budget is measured, is
+/// minutes of interpreted work. The cap itself is arithmetic, and every other test in this file
+/// exercises `build_push` under Miri already.
+///
+/// **This does not weaken any gate.** The test runs in full under `cargo test` on every pull
+/// request. Miri is layered on top, and skipping the slowest case there removes nothing from what
+/// CI already proves.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "258 commands, each canonically encoded; see the note above"
+)]
 fn the_entry_count_cap_binds_too() {
     let (mut engine, _storage) = new_engine();
     // Two more than the cap, each tiny, with an effectively unlimited byte budget.

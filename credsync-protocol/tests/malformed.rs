@@ -22,8 +22,9 @@ use proptest::prelude::*;
 macro_rules! never_panics_on {
     ($name:ident, $ty:ty, $strategy:expr) => {
         proptest! {
-            #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+            #![proptest_config(common::config(512))]
             #[test]
+            #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
             fn $name(bytes in $strategy) {
                 // The result is deliberately ignored: what is asserted is that control returns
                 // at all. A panic here fails the test by unwinding.
@@ -63,8 +64,9 @@ never_panics_on!(
 macro_rules! truncation_sweep {
     ($name:ident, $ty:ty, $strategy:expr) => {
         proptest! {
-            #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+            #![proptest_config(common::config(64))]
             #[test]
+            #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
             fn $name(value in $strategy) {
                 let full = canonical::to_vec(&value).expect("encodes");
                 for cut in 0..full.len() {

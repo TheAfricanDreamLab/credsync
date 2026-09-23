@@ -15,8 +15,9 @@ use proptest::prelude::*;
 macro_rules! roundtrip_test {
     ($name:ident, $strategy:expr) => {
         proptest! {
-            #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+            #![proptest_config(common::config(256))]
             #[test]
+            #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
             fn $name(value in $strategy) {
                 let bytes = canonical::to_vec(&value).expect("encodes");
                 let back = canonical::from_slice(&bytes).expect("decodes");
@@ -69,6 +70,7 @@ roundtrip_test!(forced_upgrade_roundtrips, common::forced_upgrade());
 proptest! {
     /// The `op`/`snapshot` rule survives a round trip in both directions.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn change_op_snapshot_rule_holds(value in common::change()) {
         prop_assert!(value.validate().is_ok());
         let bytes = canonical::to_vec(&value).expect("encodes");
@@ -78,6 +80,7 @@ proptest! {
 
     /// A rejection always carries its reason after a round trip.
     #[test]
+    #[cfg_attr(miri, ignore = "proptest strategies are prohibitively slow under Miri; see the miri job in rust.yml")]
     fn command_result_reason_rule_holds(value in common::command_result()) {
         prop_assert!(value.validate().is_ok());
         let bytes = canonical::to_vec(&value).expect("encodes");

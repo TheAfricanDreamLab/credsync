@@ -15,6 +15,22 @@
 //! Both DoD boxes fall out of that single invariant — nothing acknowledged is lost, and nothing
 //! leaves silently — which is a sign it is the right invariant rather than two coincidences.
 
+// Not run under Miri, and the case count is not the reason.
+//
+// Each case here drives the whole engine — dozens of batches, hundreds of canonical JSON
+// encodings, a full storage fake — so even two cases is minutes of interpreted work, and the
+// suite dominated the Miri job while adding nothing to it.
+//
+// What Miri buys this project is soundness of the *dependencies* we lean on (`serde_json`,
+// `twox-hash`, `blake3`), because `credsync-core` and `credsync-protocol` are both
+// `#![forbid(unsafe_code)]` and cannot express undefined behaviour at all. The unit suites in
+// `tests/apply.rs`, `tests/outbox.rs` and `tests/conflict.rs` walk every one of those code paths
+// under Miri already. More inputs through the same unsafe code finds no new unsoundness; it
+// finds logic bugs, which is what the native run at 256 cases is for.
+//
+// **This does not weaken any gate.** Every property below runs in full on every pull request
+// under `cargo test`, and at 4096 cases nightly.
+#![cfg(not(miri))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -65,7 +81,7 @@ fn to_result(n: u8, v: Verdict) -> credsync_protocol::CommandResult {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(config(256))]
 
     /// DoD 1 and 2 together: every command is queued or resolved, never both, never neither.
     #[test]

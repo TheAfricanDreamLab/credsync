@@ -148,6 +148,10 @@ and reinstall with the minimal profile.
 Miri is slow. Cap the property tests while iterating — `PROPTEST_CASES=8` — and let CI run the
 full count.
 
+CI runs both of these as required status checks from CS-10 onward, plus a nightly job at
+sixteen times the property-test case count. `PROPTEST_CASES` reaches every suite in the
+workspace through `common::config`, so one variable retunes all of them.
+
 From CS-11 onward, also:
 
 ```sh
