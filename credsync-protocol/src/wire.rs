@@ -170,7 +170,7 @@ pub struct EntityRegistration {
 /// One entry in the append-only change log. `docs/spec.md` §1.
 ///
 /// Deserialization enforces the `op`/`snapshot` rule, so a `Change` that has been decoded is
-/// already known to satisfy it. See [`validated`] for why that is done this way.
+/// already known to satisfy it. See the `validated` module for why that is done this way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ChangeRepr")]
 pub struct Change {

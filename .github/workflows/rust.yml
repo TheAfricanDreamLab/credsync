@@ -16,6 +16,10 @@ env:
   CARGO_TERM_COLOR: always
   # A warning that nobody sees becomes a warning that nobody fixes.
   RUSTFLAGS: "-D warnings"
+  # RUSTFLAGS reaches rustc and NOT rustdoc, so without this line the `cargo doc` step below
+  # emitted warnings and exited 0 - a gate that had never once gated. A broken intra-doc link
+  # lived on main from CS-3 to CS-10 with every PR green (#44).
+  RUSTDOCFLAGS: "-D warnings"
 
 jobs:
   check:
