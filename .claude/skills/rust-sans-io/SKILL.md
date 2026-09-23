@@ -118,6 +118,32 @@ Do all five in **one** PR. A transition without its test is not done.
 5. **Add the invariant** to `credsync-sim` if the transition makes a claim about behaviour under
    fault — and **break it once** to confirm the invariant catches it before trusting it.
 
+## Staging a transaction: read your own writes
+
+Anything that batches several changes into one `Storage::transact` call must track what the batch
+has already decided, because **none of it has committed yet**. `Storage::row_version` answers from
+the database, which still holds the pre-batch state, so a lookup for a row an earlier change in
+the same batch created or deleted returns the wrong answer.
+
+This is not hypothetical. It shipped in the first draft of CS-7 and the property test caught it on
+a two-change sequence (D-041): a row upserted and then tombstoned inside one batch was added to the
+scope digest and never subtracted, because the tombstone looked up a row storage had never heard
+of. The client would then disagree with the server on every subsequent pull and re-bootstrap the
+scope forever — the divergence detector firing on damage it had caused itself.
+
+The fix is an in-batch overlay consulted before storage:
+
+```rust
+let current = match staged.get(&key) {
+    Some(pending) => *pending,           // this batch already decided
+    None => storage.row_version(e, i)?,  // fall back to committed state
+};
+```
+
+Any future slice that stages multi-op transactions — the outbox at CS-8, migrations at CS-20 —
+needs the same discipline. If your staging logic reads state that your own ops are about to
+change, it must read the overlay first.
+
 ## Testing this layer
 
 The core is the easiest thing in the repo to test well, precisely because it is pure: state in,

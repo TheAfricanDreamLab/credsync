@@ -53,19 +53,23 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
 pub mod effect;
 pub mod engine;
 pub mod error;
 pub mod event;
+pub mod scope;
 pub mod storage;
 pub mod traits;
 pub mod types;
 pub mod wire;
 
+pub use apply::{Applied, ApplyError};
 pub use effect::{Effect, Telemetry};
 pub use engine::Engine;
 pub use error::{StorageError, TransportError};
 pub use event::Event;
+pub use scope::ScopeState;
 pub use storage::{StorageOp, TxOutcome};
 pub use traits::{Clock, Entropy, Storage, Transport};
 pub use types::{RequestId, Timestamp};

@@ -27,6 +27,7 @@ use credsync_core::{
     Clock, Engine, Entropy, RequestId, Storage, StorageError, StorageOp, Timestamp, Transport,
     TransportError, TxOutcome, WireRequest,
 };
+use credsync_protocol::{EntityId, EntityName, RowVersion};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -62,6 +63,18 @@ impl Storage for RcStorage {
     fn transact(&mut self, ops: &[StorageOp]) -> Result<TxOutcome, StorageError> {
         self.0.borrow_mut().extend_from_slice(ops);
         Ok(TxOutcome::new(ops.len()))
+    }
+
+    /// Holds no rows, so every lookup is a miss.
+    ///
+    /// This file is about thread bounds, not about storage behaviour — what matters here is that
+    /// the method can be implemented by a type carrying an `Rc`, which is the whole assertion.
+    fn row_version(
+        &self,
+        _entity: &EntityName,
+        _entity_id: &EntityId,
+    ) -> Result<Option<RowVersion>, StorageError> {
+        Ok(None)
     }
 }
 

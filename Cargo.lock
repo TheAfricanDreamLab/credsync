@@ -84,6 +84,8 @@ name = "credsync-core"
 version = "0.0.1"
 dependencies = [
  "credsync-protocol",
+ "proptest",
+ "serde_json",
 ]
 
 [[package]]
