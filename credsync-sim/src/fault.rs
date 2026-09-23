@@ -51,6 +51,17 @@ pub struct FaultRates {
     pub server_restart: u32,
     /// Restart a device, reloading its engine from storage.
     pub device_restart: u32,
+    /// Send a structurally valid batch that breaks a protocol rule.
+    ///
+    /// Distinct from `malformed_bytes`, which produces something that does not decode at all. A
+    /// buggy or hostile server sends batches that decode perfectly and are still wrong — a
+    /// repeated `seq`, a `next_cursor` that does not cover what was sent. The client's ordering
+    /// checks exist for exactly this, and without the fault they were never exercised: the
+    /// simulated server builds batches from its log, where seqs increase by construction.
+    ///
+    /// Added at CS-13, because the planted-bug drill found that loosening the ordering check
+    /// changed nothing the harness could see.
+    pub protocol_violation: u32,
     /// Milliseconds of network latency, drawn uniformly from this range.
     pub latency_ms: (u32, u32),
 }
@@ -73,6 +84,7 @@ impl Default for FaultRates {
             storage_commit_then_kill: 4,
             server_restart: 2,
             device_restart: 3,
+            protocol_violation: 5,
             latency_ms: (20, 2_000),
         }
     }
@@ -93,6 +105,7 @@ impl FaultRates {
             storage_commit_then_kill: 0,
             server_restart: 0,
             device_restart: 0,
+            protocol_violation: 0,
             latency_ms: (10, 10),
         }
     }
@@ -125,6 +138,8 @@ pub enum Fault {
     ServerRestarted,
     /// A device restarted and reloaded from storage.
     DeviceRestarted,
+    /// The server sent a batch that decoded cleanly and broke a protocol rule.
+    ProtocolViolation,
 }
 
 impl Fault {
@@ -145,6 +160,7 @@ impl Fault {
             Self::StorageCommittedThenKilled => "storage-committed-then-killed",
             Self::ServerRestarted => "server-restarted",
             Self::DeviceRestarted => "device-restarted",
+            Self::ProtocolViolation => "protocol-violation",
         }
     }
 
@@ -152,7 +168,7 @@ impl Fault {
     ///
     /// A `const` list rather than a derived iterator so that adding a variant without adding it
     /// here is visible: the coverage report would show one fewer row than the menu.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Dropped,
         Self::Duplicated,
         Self::Reordered,
@@ -163,6 +179,7 @@ impl Fault {
         Self::StorageCommittedThenKilled,
         Self::ServerRestarted,
         Self::DeviceRestarted,
+        Self::ProtocolViolation,
     ];
 }
 

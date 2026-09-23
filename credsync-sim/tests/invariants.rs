@@ -608,3 +608,71 @@ fn a_cursor_that_vanishes_is_caught() {
     assert_eq!(inv.violations()[0].invariant, "cursor-monotonicity");
     assert!(inv.violations()[0].detail.contains("vanished"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Applied state — the check the CS-13 drill produced
+// ---------------------------------------------------------------------------------------------
+
+/// A row stored at the wrong version for its cursor is caught, while it is still wrong.
+///
+/// The strongest claim in the set, and the one that catches ordering bugs as they happen.
+/// `check_convergence` compares digests once a run has gone quiet, which is far weaker than it
+/// looks: a row corrupted mid-run is silently repaired by the next change to touch it, so only a
+/// corruption in the final tail batch survives to be seen — and the tail is usually one change.
+///
+/// The CS-13 drill planted an ordering bug that the unit suite caught instantly and the simulator
+/// missed across thirty seeds. This check is what closed that gap; with it, the same bug is caught
+/// on every seed within hours of simulated time.
+#[test]
+fn a_row_at_the_wrong_version_for_its_cursor_is_caught() {
+    let mut world = World::new(5, FaultRates::none(), Trace::counting());
+    world.run(400);
+    assert!(world.invariants.holds(), "the control run must be clean");
+
+    // Corrupt one row behind the engine's back: the version regresses while the cursor does not.
+    let dbs = world.databases();
+    let key = {
+        let db = dbs[0].borrow();
+        db.rows.keys().next().cloned()
+    };
+    let Some(key) = key else {
+        panic!("the run applied no rows, so this proves nothing");
+    };
+    {
+        let mut db = dbs[0].borrow_mut();
+        if let Some(row) = db.rows.get_mut(&key) {
+            row.row_version = RowVersion::new(1).expect("valid row version");
+        }
+    }
+
+    let mut inv = Invariants::new();
+    inv.check_applied_state(1, &dbs, world.server(), world.scope());
+
+    assert!(
+        !inv.holds(),
+        "a row rolled back to version 1 was not caught"
+    );
+    assert_eq!(inv.violations()[0].invariant, "applied-state");
+}
+
+/// A healthy run never trips the applied-state check.
+///
+/// The control. Without it, the test above would also pass against a checker that fired on
+/// everything, which would be a different bug with the same green result.
+#[test]
+fn applied_state_is_silent_on_a_healthy_run() {
+    for seed in 0..4 {
+        let mut world = World::new(seed, FaultRates::default(), Trace::counting());
+        world.run(800);
+        let applied: Vec<_> = world
+            .invariants
+            .violations()
+            .iter()
+            .filter(|v| v.invariant == "applied-state")
+            .collect();
+        assert!(
+            applied.is_empty(),
+            "seed {seed} tripped applied-state on a healthy engine: {applied:?}"
+        );
+    }
+}

@@ -123,6 +123,48 @@ The only way to know whether the harness works is to give it bugs to find.
 Run at CS-13, and repeated with a **new bug class** at CS-30. Reusing the same three bugs only
 proves the harness still catches bugs it has already been tuned to catch.
 
+### What CS-13 actually found
+
+**The harness failed the drill twice before it passed.** That is the outcome to expect, and the
+reason the drill exists — a rig that catches everything first time was probably not being asked
+anything hard.
+
+| Bug | First attempt | After the fix |
+|---|---|---|
+| ordering — apply a batch's changes in reverse | **0 / 30 seeds** | 5/5, within hours of simulated time |
+| dedupe — resolve a repeated push result twice | **0 / 8 seeds** | 8/8, seed 0, within 37 simulated minutes |
+| conflict — drop a superseded owner draft instead of recovering it | 8/8 immediately | — |
+
+Three gaps came out of it, all now closed:
+
+1. **The simulated server was too well behaved.** It built batches from its own log, where seqs
+   increase by construction, and pushes from the outbox, which never names a command twice. So the
+   client's ordering and dedupe checks were never exercised by anything. Hence the
+   `protocol_violation` fault: a response that decodes perfectly and is still wrong.
+2. **Convergence at quiescence is far weaker than it looks.** A row corrupted mid-run is silently
+   repaired by the next change to touch it, so only a corruption in the *final tail batch* ever
+   survives to be compared — and the tail is usually one change. `check_applied_state` replaced it
+   as the primary ordering check: every row must be at the version its cursor implies, checked
+   every step.
+3. **Idempotency only fired on *differing* verdicts.** The duplicated result was an exact copy, so
+   both verdicts agreed and the check stayed silent. One command with two recorded outcomes is
+   wrong even when the two agree.
+
+The lesson worth carrying: **an invariant that has never fired tells you nothing about the code,
+only about itself.** Two of these had passed a thousand seeds while being unable to see the bug
+class they were written for.
+
+### Choosing a bug to plant
+
+Not every mutation is a bug. Two of the first attempts at the ordering bug caused no damage at
+all, because the apply path's staging overlay makes re-applying an identical change a genuine
+no-op — the digest arithmetic is idempotent there. A planted bug that corrupts nothing proves
+nothing about the harness.
+
+Plant something that leaves observably wrong *state*: a row at the wrong version, an outcome
+recorded twice, a user's edit dropped. Then confirm the unit suite catches it too — if the unit
+tests are silent as well, the bug may simply be harmless.
+
 ## Never do this
 
 - **Never weaken a fault distribution to make CI pass.** The correct response to a red batch is a

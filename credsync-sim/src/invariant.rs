@@ -440,6 +440,67 @@ impl Invariants {
         }
     }
 
+    /// **Applied state.** Every row a device holds is at the version its cursor implies.
+    ///
+    /// The strongest claim here, and the one that catches ordering bugs while they are happening.
+    /// A device whose cursor is at `C` has applied every change up to `C`, so each row it holds
+    /// must be at the version of the latest change to that row at or below `C`. Anything else
+    /// means changes were applied in the wrong order, skipped, or applied twice.
+    ///
+    /// Checked continuously, which matters more than it first appears. `check_convergence`
+    /// compares digests once the run has gone quiet, and that is far weaker: a row corrupted
+    /// mid-run is silently repaired by the next change to touch it, so only a corruption in the
+    /// final tail batch survives to be seen — and the tail is usually a single change. The CS-13
+    /// drill planted an ordering bug that the unit tests caught immediately and the simulator
+    /// missed across thirty seeds, which is how this check came to exist.
+    pub fn check_applied_state(
+        &mut self,
+        at_ms: i64,
+        databases: &[std::rc::Rc<std::cell::RefCell<Db>>],
+        server: &Server,
+        scope: &ScopeId,
+    ) {
+        for (i, db) in databases.iter().enumerate() {
+            let db = db.borrow();
+            let Some(cursor) = db.cursors.get(scope) else {
+                continue;
+            };
+            let cursor = cursor.get();
+
+            for ((entity, entity_id), stored) in &db.rows {
+                let expected = server.row_version_at(scope, entity, entity_id, cursor);
+                match expected {
+                    Some(v) if v == stored.row_version => {}
+                    Some(v) => {
+                        self.violations.push(Violation {
+                            invariant: "applied-state",
+                            device: Some(i),
+                            detail: format!(
+                                "{entity}/{entity_id} is at version {} but the cursor {cursor} \
+                                 implies {}",
+                                stored.row_version.get(),
+                                v.get()
+                            ),
+                            at_ms,
+                        });
+                    }
+                    None => {
+                        self.violations.push(Violation {
+                            invariant: "applied-state",
+                            device: Some(i),
+                            detail: format!(
+                                "{entity}/{entity_id} is stored at version {} but no change at or \
+                                 below the cursor {cursor} ever created it",
+                                stored.row_version.get()
+                            ),
+                            at_ms,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// **Durable effects.** A row the cursor implies must actually be present.
     ///
     /// The verdict checks above inspect only `db.resolved`, so an applied command whose row

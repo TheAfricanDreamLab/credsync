@@ -255,6 +255,8 @@ impl World {
             .check_cursor_bounds(self.now_ms, &dbs, &self.server, &self.scope);
         self.invariants
             .check_durable_effects(self.now_ms, &dbs, &self.server, &self.scope);
+        self.invariants
+            .check_applied_state(self.now_ms, &dbs, &self.server, &self.scope);
     }
 
     /// One device's turn.
@@ -398,12 +400,30 @@ impl World {
                     continue;
                 }
 
+                // A server that decodes cleanly and is still wrong. Distinct from `malformed`,
+                // which produces bytes that do not decode at all — this is a buggy or hostile
+                // peer, and the client's ordering and dedupe checks exist for precisely it.
+                //
+                // Added at CS-13: the drill planted an ordering bug and a dedupe bug that the
+                // unit tests caught instantly and the simulator could not reach, because a server
+                // built from its own log never repeats a seq and a push built from the outbox
+                // never names a command twice.
+                let violate = self.rng.chance(self.rates.protocol_violation);
+
                 let response = match &out.request {
                     WireRequest::Pull(req) => {
-                        Ok(WireResponse::Pull(self.server.pull(req, PULL_LIMIT)))
+                        let mut pulled = self.server.pull(req, PULL_LIMIT);
+                        if violate && repeat_last_change(&mut pulled) {
+                            self.trace.fault(self.now_ms, i, Fault::ProtocolViolation);
+                        }
+                        Ok(WireResponse::Pull(pulled))
                     }
                     WireRequest::Push(req) => {
-                        Ok(WireResponse::Push(self.server.push(req, &mut self.rng)))
+                        let mut pushed = self.server.push(req, &mut self.rng);
+                        if violate && repeat_last_result(&mut pushed) {
+                            self.trace.fault(self.now_ms, i, Fault::ProtocolViolation);
+                        }
+                        Ok(WireResponse::Push(pushed))
                     }
                     WireRequest::Bootstrap(_) => continue,
                     _ => continue,
@@ -614,6 +634,42 @@ fn command_id(device: u8, n: u8) -> CommandId {
     bytes[14] = device;
     bytes[15] = n;
     CommandId::from_bytes(bytes).unwrap_or_else(|_| unreachable!("version nibble is 7"))
+}
+
+/// Repeats the last result in a push response, so one command is answered twice.
+///
+/// `docs/spec.md` §3.3 gives one result per submitted command. A client that resolves both copies
+/// records two outcomes for one command, and if the verdicts differ the stored one depends on
+/// write order — a dead letter for a command the host applied, or an "applied" masking a
+/// rejection the user needed to see.
+///
+/// Returns whether anything was repeated, so the trace never counts a fault that did not happen.
+fn repeat_last_result(response: &mut credsync_protocol::PushResponse) -> bool {
+    if let Some(last) = response.results.last().cloned() {
+        response.results.push(last);
+        return true;
+    }
+    false
+}
+
+/// Breaks a protocol rule in a batch that is otherwise perfectly well-formed.
+///
+/// Repeats the last change, `seq` and all. `docs/spec.md` §4 requires changes within a scope to be
+/// strictly `seq`-ordered, so a client that accepts this applies one change twice — and since the
+/// scope digest deliberately does not cancel duplicates (D-032), the damage persists and surfaces
+/// much later as divergence pointing nowhere near its cause.
+///
+/// Returns whether anything was actually corrupted, so the trace does not record a fault that did
+/// not happen: an empty batch has no change to repeat, and a fault counted but never applied is a
+/// coverage report that lies.
+fn repeat_last_change(response: &mut credsync_protocol::PullResponse) -> bool {
+    for batch in &mut response.batches {
+        if let Some(last) = batch.changes.last().cloned() {
+            batch.changes.push(last);
+            return true;
+        }
+    }
+    false
 }
 
 fn hex_placeholder() -> HexString {
