@@ -5,10 +5,14 @@
 //! finished, and quietly swallow every event fed to it. An absent method is a compile error at
 //! the call site, which is the failure anyone would rather have.
 
+use crate::apply::{self, Applied, ApplyError};
 use crate::effect::Effect;
+use crate::scope::ScopeState;
+use crate::storage::StorageOp;
 use crate::traits::{Clock, Entropy, Storage, Transport};
 use core::fmt;
-use std::collections::VecDeque;
+use credsync_protocol::{Batch, ScopeId};
+use std::collections::{BTreeMap, VecDeque};
 
 /// The credSync client state machine.
 ///
@@ -45,6 +49,15 @@ where
     /// Queued for the caller to drain. Ordered: effect order is part of the engine's observable
     /// behaviour, and the simulator asserts two runs of one seed produce the same stream.
     effects: VecDeque<Effect>,
+    /// Per-scope cursor and digest.
+    ///
+    /// `BTreeMap`, not `HashMap`. `HashMap`'s iteration order is randomised per process, and
+    /// anything that iterates scopes — a sync cycle's request order, a telemetry dump, a
+    /// simulator trace — would then differ between two runs of the same seed. Deterministic
+    /// replay is the property this entire crate exists to preserve, and it is lost in exactly
+    /// this sort of quiet way. The workspace denies `clippy::iter_over_hash_type` for the same
+    /// reason.
+    scopes: BTreeMap<ScopeId, ScopeState>,
 }
 
 impl<C, E, S, T> Engine<C, E, S, T>
@@ -62,7 +75,97 @@ where
             storage,
             transport,
             effects: VecDeque::new(),
+            scopes: BTreeMap::new(),
         }
+    }
+
+    /// Seeds a scope's cursor and digest from what storage holds.
+    ///
+    /// Called at startup, once per subscribed scope. Without it the engine treats a scope as
+    /// never synced and pulls it from the beginning — correct, but it would re-walk the entire
+    /// change log on every app launch.
+    pub fn restore_scope(&mut self, scope: ScopeId, state: ScopeState) {
+        self.scopes.insert(scope, state);
+    }
+
+    /// This client's cursor and digest for a scope, if it has any.
+    #[must_use]
+    pub fn scope_state(&self, scope: &ScopeId) -> Option<&ScopeState> {
+        self.scopes.get(scope)
+    }
+
+    /// Applies one pulled batch: validate, stage, commit, then advance.
+    ///
+    /// # The order of operations is the correctness argument
+    ///
+    /// 1. **Validate everything first.** A batch that will be refused never reaches storage.
+    /// 2. **Stage into one `Vec<StorageOp>`** — every row, then the cursor, then the digest.
+    /// 3. **Commit once.** `docs/spec.md` §4: the cursor is persisted in the same transaction as
+    ///    the rows it covers, so a process killed at any moment either has all of it or none.
+    /// 4. **Advance memory only after the commit returns `Ok`.** A failed transaction leaves the
+    ///    engine describing the state the database is actually in, so the batch can simply be
+    ///    refetched.
+    ///
+    /// Reversing 3 and 4 is the classic version of this bug: a cursor advanced in memory, a
+    /// commit that fails, and a client that never asks for those changes again. It reports
+    /// success forever while missing rows it silently skipped.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError`] if the batch breaks an ordering rule, carries an inconsistent
+    /// change, or storage refuses the transaction. In every case **nothing is written and no
+    /// state moves**.
+    pub fn apply_batch(&mut self, batch: &Batch) -> Result<Applied, ApplyError> {
+        let state = self.scopes.get(&batch.scope).copied().unwrap_or_default();
+
+        apply::validate_ordering(batch, state.cursor.get())?;
+
+        // Staged against a copy. If anything below fails, the real digest is untouched.
+        let mut digest = state.digest;
+        let mut ops: Vec<StorageOp> = Vec::with_capacity(batch.changes.len() + 2);
+        // Tracks what earlier changes in THIS batch did, since they have not committed yet and
+        // are therefore invisible to `Storage::row_version`. See `apply::stage_change`.
+        let mut staged = apply::Staged::new();
+
+        for change in &batch.changes {
+            apply::stage_change(&self.storage, change, &mut digest, &mut ops, &mut staged)?;
+        }
+
+        // The cursor and digest ride in the same transaction as the rows. Not a convenience:
+        // see the method docs, and `docs/spec.md` §4.
+        ops.push(StorageOp::SetCursor {
+            scope: batch.scope.clone(),
+            cursor: batch.next_cursor,
+        });
+        ops.push(StorageOp::SetScopeDigest {
+            scope: batch.scope.clone(),
+            digest: digest.to_hex(),
+        });
+
+        let outcome = self.storage.transact(&ops)?;
+        debug_assert_eq!(
+            outcome.applied,
+            ops.len(),
+            "an adapter reported a partial commit as success"
+        );
+
+        // Committed. Only now does anything in memory move.
+        self.scopes.insert(
+            batch.scope.clone(),
+            ScopeState::restored(batch.next_cursor, digest),
+        );
+
+        // `docs/spec.md` §5: the client compares after apply. A mismatch is silent divergence —
+        // both sides walked the same log and hold different rows. Marking the scope tainted and
+        // re-bootstrapping is CS-22 (#23); detecting and reporting it is this slice.
+        let diverged = digest.to_hex() != batch.digest;
+        if diverged {
+            self.emit(Effect::Emit(apply::divergence(batch, &digest)));
+        }
+
+        Ok(Applied {
+            changes: batch.changes.len(),
+            diverged,
+        })
     }
 
     /// Takes the next queued effect, oldest first.

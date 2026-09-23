@@ -27,6 +27,7 @@ use crate::error::{StorageError, TransportError};
 use crate::storage::{StorageOp, TxOutcome};
 use crate::types::{RequestId, Timestamp};
 use crate::wire::WireRequest;
+use credsync_protocol::{EntityId, EntityName, RowVersion};
 
 /// Reads the wall clock.
 ///
@@ -57,7 +58,7 @@ pub trait Entropy {
     fn fill(&mut self, buf: &mut [u8]);
 }
 
-/// Commits a batch of writes atomically.
+/// Commits a batch of writes atomically, and reports what a row is currently at.
 ///
 /// The batch commits whole or not at all. See [`crate::storage`] for why that is load-bearing
 /// rather than merely tidy.
@@ -70,6 +71,34 @@ pub trait Storage {
     /// partially apply and report success — the engine has no way to detect that, and `applied`
     /// disagreeing with the op count is the only signal it gets.
     fn transact(&mut self, ops: &[StorageOp]) -> Result<TxOutcome, StorageError>;
+
+    /// The version a live row currently holds, or `None` if no such row is stored.
+    ///
+    /// Added at CS-7 (D-039). The scope digest is a sum of per-row hashes over
+    /// `(entity, entity_id, row_version)`, so replacing a row means *subtracting the old
+    /// contribution* before adding the new one — and that is impossible without knowing which
+    /// version is being replaced. A tombstone has the same problem: the row being removed must
+    /// be subtracted at the version it was actually stored at, not at the version the change
+    /// happens to mention.
+    ///
+    /// The alternative was to have each adapter maintain the digest itself, since it already
+    /// knows the row it is overwriting. That was rejected: it would put the subtlest arithmetic
+    /// in the system into every port, where a single wrong tombstone silently produces phantom
+    /// divergence reports on real devices.
+    ///
+    /// Keyed by `(entity, entity_id)` with no scope, because the entity registry maps each
+    /// entity to exactly one scope (`docs/spec.md` §1) — so the pair already identifies a row
+    /// uniquely, and passing a scope would invite the two from disagreeing.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] if the local database cannot be read. A *missing row*
+    /// is `Ok(None)`, not an error: the first time any row arrives it is absent, so treating
+    /// that as a failure would make every insert an error.
+    fn row_version(
+        &self,
+        entity: &EntityName,
+        entity_id: &EntityId,
+    ) -> Result<Option<RowVersion>, StorageError>;
 }
 
 /// Hands a request to the network.
