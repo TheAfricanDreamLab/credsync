@@ -23,12 +23,14 @@
 
 pub mod fakes;
 pub mod fault;
+pub mod invariant;
 pub mod rng;
 pub mod server;
 pub mod trace;
 pub mod world;
 
 pub use fault::{Fault, FaultRates};
+pub use invariant::{Invariants, Violation};
 pub use rng::Rng;
 pub use server::Server;
 pub use trace::Trace;

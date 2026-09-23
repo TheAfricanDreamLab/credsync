@@ -17,6 +17,7 @@ use crate::fakes::{
 use crate::fault::{
     FLAP_DURATION_MS, Fault, FaultRates, SKEW_MAGNITUDE_MS, decide_response, decide_storage,
 };
+use crate::invariant::Invariants;
 use crate::rng::Rng;
 use crate::server::Server;
 use crate::trace::Trace;
@@ -56,6 +57,13 @@ struct Device {
     requests_sent: u64,
     /// Commands this device has authored, so ids stay unique and deterministic.
     commands_authored: u8,
+    /// Set when the next transaction commits and then loses its acknowledgement.
+    ///
+    /// The device must be **restarted** at that point, because that fault is a process kill: the
+    /// write reached the disk and the engine died before hearing so. Letting the engine carry on
+    /// would model something else entirely — a storage layer that lies about committing — and
+    /// would leave in-memory state describing a database that has moved on without it.
+    pending_kill: bool,
 }
 
 /// The whole simulation.
@@ -70,8 +78,19 @@ pub struct World {
     held: Vec<InFlight>,
     scope: ScopeId,
     entity: EntityName,
+    /// While set, nobody authors new work: the world is draining, not living.
+    ///
+    /// Convergence is a claim about where things settle, and a world that keeps writing never
+    /// settles. Turning the faults off is not enough — devices would carry on authoring and the
+    /// server would carry on taking external writes, so the log would outrun the devices forever
+    /// and every run would look divergent.
+    quiet: bool,
     /// What the run recorded.
     pub trace: Trace,
+    /// The claims being checked, and anything that has broken one.
+    pub invariants: Invariants,
+    /// A copy of the registry every device was built with, for policy conformance.
+    registry: credsync_core::Registry,
 }
 
 impl World {
@@ -93,6 +112,11 @@ impl World {
 
         let mut server = Server::new();
         server.register_command("submit_reflection", entity.clone(), scope.clone());
+
+        // The same declaration every device is built with, kept so the policy invariant is
+        // generated from what the host registered rather than from a hardcoded list (D-047).
+        let mut registry = credsync_core::Registry::new();
+        register(&mut registry, &entity, &scope);
 
         let devices = (0..device_count)
             .map(|_| {
@@ -123,6 +147,7 @@ impl World {
                     offline_until_ms: 0,
                     requests_sent: 0,
                     commands_authored: 0,
+                    pending_kill: false,
                 }
             })
             .collect();
@@ -137,7 +162,10 @@ impl World {
             held: Vec::new(),
             scope,
             entity,
+            quiet: false,
             trace,
+            invariants: Invariants::new(),
+            registry,
         }
     }
 
@@ -153,11 +181,42 @@ impl World {
         self.now_ms - 1_756_137_600_000
     }
 
-    /// Runs `steps` of simulated time.
+    /// Runs `steps` of simulated time, then lets the world go quiet and checks convergence.
     pub fn run(&mut self, steps: u32) {
         for _ in 0..steps {
             self.step();
         }
+        self.settle();
+    }
+
+    /// Runs on with the faults switched off until every device has caught up.
+    ///
+    /// Convergence is the one claim that needs quiescence: a device mid-batch is *supposed* to
+    /// disagree with the server, and calling that divergence would make the invariant fire on
+    /// entirely normal operation — which is how an invariant gets switched off.
+    ///
+    /// So the network is made perfect and everyone is given time to finish. A device that still
+    /// disagrees after that is genuinely divergent.
+    pub fn settle(&mut self) {
+        let hostile = self.rates;
+        self.rates = FaultRates::none();
+        self.quiet = true;
+        for d in &self.devices {
+            *d.transport.online.borrow_mut() = true;
+        }
+        // Enough cycles for the slowest device to walk the whole log at PULL_LIMIT changes per
+        // pull, plus room for the latency of each round trip.
+        for _ in 0..600 {
+            self.step();
+        }
+        self.rates = hostile;
+        self.quiet = false;
+
+        let dbs = self.databases();
+        self.invariants
+            .check_convergence(self.now_ms, &dbs, &self.server, &self.scope);
+        self.invariants
+            .check_policy(self.now_ms, &dbs, &self.registry);
     }
 
     /// One step: advance time, let each device act, carry the network, deliver what is due.
@@ -175,7 +234,7 @@ impl World {
 
         // Somebody else is always writing: another student, a teacher grading. Without this a
         // device would only ever see changes it caused.
-        if self.rng.chance(2) {
+        if !self.quiet && self.rng.chance(2) {
             let (scope, entity) = (self.scope.clone(), self.entity.clone());
             self.server.external_change(&scope, &entity, &mut self.rng);
         }
@@ -186,6 +245,14 @@ impl World {
 
         self.carry_network();
         self.deliver_due();
+
+        // Continuously, not at quiescence. Design §7.1: a bug that self-corrects before the run
+        // ends is still a bug — it corrupted state, and only a later event happening to paper
+        // over it saved the user. Checking only at the end makes that whole class invisible.
+        let dbs = self.databases();
+        self.invariants.check_step(self.now_ms, &dbs, &self.scope);
+        self.invariants
+            .check_cursor_bounds(self.now_ms, &dbs, &self.server, &self.scope);
     }
 
     /// One device's turn.
@@ -208,7 +275,7 @@ impl World {
 
         // The user writes something. One percent per simulated minute is roughly a dozen
         // reflections a day, which is an active student rather than a load generator.
-        if self.rng.chance(1) {
+        if !self.quiet && self.rng.chance(1) {
             self.author_command(i);
         }
 
@@ -247,6 +314,19 @@ impl World {
             Ok(()) => self.trace.event(self.now_ms, i, "enqueued"),
             Err(_) => self.trace.event(self.now_ms, i, "enqueue-refused"),
         }
+        self.maybe_kill(i);
+    }
+
+    /// Carries out a kill armed by [`arm_storage`](Self::arm_storage).
+    ///
+    /// Called immediately after every engine call that could have transacted. The process died
+    /// with the write on disk, so recovery is a restart that reloads from storage and replays the
+    /// outbox against a server that dedupes — not the engine reasoning about what happened.
+    fn maybe_kill(&mut self, i: usize) {
+        if self.devices[i].pending_kill {
+            self.devices[i].pending_kill = false;
+            self.restart_device(i);
+        }
     }
 
     /// Decides whether this device's next storage transaction misbehaves.
@@ -259,6 +339,7 @@ impl World {
             Some(Fault::StorageCommittedThenKilled) => {
                 self.trace
                     .fault(self.now_ms, i, Fault::StorageCommittedThenKilled);
+                self.devices[i].pending_kill = true;
                 StorageVerdict::CommitThenLoseAck
             }
             _ => StorageVerdict::Commit,
@@ -406,6 +487,7 @@ impl World {
                             }
                             Err(_) => self.trace.event(self.now_ms, i, "apply-refused"),
                         }
+                        self.maybe_kill(i);
                     }
                 }
                 Ok(WireResponse::Push(response)) => {
@@ -417,6 +499,7 @@ impl World {
                         }
                         Err(_) => self.trace.event(self.now_ms, i, "results-refused"),
                     }
+                    self.maybe_kill(i);
                 }
                 Ok(_) => self.trace.event(self.now_ms, i, "response-ignored"),
             }
@@ -466,6 +549,7 @@ impl World {
         self.devices[i].engine = engine;
         self.devices[i].transport = transport;
         self.devices[i].clock = clock;
+        self.devices[i].pending_kill = false;
     }
 
     /// Every device's database, for the invariants at CS-12 to read.
