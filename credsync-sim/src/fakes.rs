@@ -172,6 +172,25 @@ pub struct Db {
 }
 
 impl Db {
+    /// A copy of this database, for tests that need to compare an intact state against a broken
+    /// one built from it.
+    ///
+    /// Not a `Clone` impl: a database is a device's whole durable state, and making it casually
+    /// cloneable invites a test that mutates the copy and asserts against the original.
+    #[must_use]
+    pub fn clone_for_test(&self) -> Self {
+        Self {
+            rows: self.rows.clone(),
+            cursors: self.cursors.clone(),
+            digests: self.digests.clone(),
+            outbox: self.outbox.clone(),
+            resolved: self.resolved.clone(),
+            recovered: self.recovered.clone(),
+            verdict: self.verdict,
+            commits: self.commits,
+        }
+    }
+
     /// Applies ops to a copy, so a rollback discards work that was really performed.
     fn staged(&self, ops: &[StorageOp]) -> Self {
         let mut next = Self {

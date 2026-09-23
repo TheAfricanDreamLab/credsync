@@ -253,6 +253,8 @@ impl World {
         self.invariants.check_step(self.now_ms, &dbs, &self.scope);
         self.invariants
             .check_cursor_bounds(self.now_ms, &dbs, &self.server, &self.scope);
+        self.invariants
+            .check_durable_effects(self.now_ms, &dbs, &self.server, &self.scope);
     }
 
     /// One device's turn.

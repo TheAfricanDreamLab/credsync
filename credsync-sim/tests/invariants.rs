@@ -369,3 +369,242 @@ fn devices_end_up_holding_the_same_rows() {
         "no rows were ever applied; the run proves nothing"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The checkers that had no failing case until review pointed it out
+//
+// `check_convergence`, `check_policy` and `check_cursor_bounds` were exercised only through
+// healthy runs, which cannot distinguish a working checker from one that never fires. Each now
+// has both halves.
+// ---------------------------------------------------------------------------------------------
+
+use credsync_sim::Server;
+
+/// A small server holding a few changes, for the checks that need something to compare against.
+fn server_with_changes(n: u32) -> Server {
+    let mut server = Server::new();
+    let entity = EntityName::new("reflections").expect("valid entity");
+    server.register_command("submit_reflection", entity.clone(), scope());
+    let mut rng = credsync_sim::Rng::new(7);
+    for _ in 0..n {
+        server.external_change(&scope(), &entity, &mut rng);
+    }
+    server
+}
+
+/// A cursor beyond the server's log head is caught.
+///
+/// A device claiming to have applied changes the server has not written would skip everything
+/// between — permanently, and reporting success the whole time.
+#[test]
+fn a_cursor_past_the_server_head_is_caught() {
+    let server = server_with_changes(5);
+    let mut db = Db::default();
+    db.cursors
+        .insert(scope(), Cursor::new(server.head() + 50).unwrap());
+
+    let mut inv = Invariants::new();
+    inv.check_cursor_bounds(1, &wrap(db), &server, &scope());
+
+    assert!(
+        !inv.holds(),
+        "a cursor ahead of the log head was not caught"
+    );
+    assert_eq!(inv.violations()[0].invariant, "cursor-bounds");
+}
+
+#[test]
+fn a_cursor_within_the_log_is_not_a_bounds_violation() {
+    let server = server_with_changes(5);
+    let mut db = Db::default();
+    db.cursors
+        .insert(scope(), Cursor::new(server.head()).unwrap());
+
+    let mut inv = Invariants::new();
+    inv.check_cursor_bounds(1, &wrap(db), &server, &scope());
+    assert!(inv.holds(), "{:?}", inv.violations());
+}
+
+/// A digest that disagrees with the server after settling is caught.
+#[test]
+fn a_disagreeing_digest_after_settling_is_caught() {
+    let server = server_with_changes(5);
+    let mut db = Db::default();
+    db.cursors
+        .insert(scope(), Cursor::new(server.head()).unwrap());
+    db.digests.insert(
+        scope(),
+        credsync_protocol::HexString::new("ffffffffffffffffffffffffffffffff").expect("valid hex"),
+    );
+
+    let mut inv = Invariants::new();
+    inv.check_convergence(1, &wrap(db), &server, &scope());
+
+    assert!(!inv.holds(), "a wrong digest was not caught");
+    assert_eq!(inv.violations()[0].invariant, "convergence");
+}
+
+/// A device that never caught up is reported, not skipped.
+///
+/// `World::settle` runs a fixed number of steps, so a device still behind is one the run gave up
+/// on. Skipping it silently would let the whole run report success — the invariant declining to
+/// check, which is worse than an invariant that fails.
+#[test]
+fn a_device_that_never_caught_up_is_caught() {
+    let server = server_with_changes(10);
+    let mut db = Db::default();
+    db.cursors.insert(scope(), Cursor::new(1).unwrap());
+    db.digests.insert(scope(), server.digest(&scope()).to_hex());
+
+    let mut inv = Invariants::new();
+    inv.check_convergence(1, &wrap(db), &server, &scope());
+
+    assert!(!inv.holds(), "a device stuck far behind was skipped");
+    assert!(inv.violations()[0].detail.contains("never caught up"));
+}
+
+/// A device with no digest at all, while the server holds changes, is reported.
+#[test]
+fn a_device_with_no_digest_is_caught_when_the_server_has_changes() {
+    let server = server_with_changes(5);
+    let mut inv = Invariants::new();
+    inv.check_convergence(1, &wrap(Db::default()), &server, &scope());
+
+    assert!(!inv.holds(), "a device that synced nothing was skipped");
+    assert!(inv.violations()[0].detail.contains("no digest"));
+}
+
+/// An empty server means there is nothing to converge to, and that is not a violation.
+#[test]
+fn a_device_with_no_digest_is_fine_when_the_server_is_empty() {
+    let server = Server::new();
+    let mut inv = Invariants::new();
+    inv.check_convergence(1, &wrap(Db::default()), &server, &scope());
+    assert!(inv.holds(), "{:?}", inv.violations());
+}
+
+/// A superseded owner draft with no recovered draft is caught.
+///
+/// `docs/spec.md` §6: the losing version returns to the device and is stored. Silent loss is a
+/// protocol violation, not a tradeoff — the user's text exists nowhere else once the entry leaves
+/// the outbox.
+#[test]
+fn a_superseded_command_with_no_recovered_draft_is_caught() {
+    let mut registry = credsync_core::Registry::new();
+    registry.register_entity(credsync_protocol::EntityRegistration {
+        entity: EntityName::new("reflections").expect("valid entity"),
+        scope: scope(),
+        conflict_class: credsync_protocol::ConflictClass::OwnerDraft,
+        schema_version: schema(),
+    });
+    registry.register_command(
+        CommandName::new("submit_reflection").expect("valid name"),
+        EntityName::new("reflections").expect("valid entity"),
+    );
+
+    let mut db = Db::default();
+    db.resolved.push((command_id(1), Resolution::Superseded));
+
+    let mut inv = Invariants::new();
+    inv.check_policy(1, &wrap(db), &registry);
+
+    assert!(!inv.holds(), "a lost owner draft was not caught");
+    assert_eq!(inv.violations()[0].invariant, "policy-conformance");
+    assert!(
+        inv.violations()[0]
+            .detail
+            .contains("no draft was recovered")
+    );
+}
+
+/// A superseded command whose draft *was* recovered is silent.
+#[test]
+fn a_superseded_command_with_its_draft_recovered_is_not_a_violation() {
+    let mut registry = credsync_core::Registry::new();
+    registry.register_entity(credsync_protocol::EntityRegistration {
+        entity: EntityName::new("reflections").expect("valid entity"),
+        scope: scope(),
+        conflict_class: credsync_protocol::ConflictClass::OwnerDraft,
+        schema_version: schema(),
+    });
+
+    let mut db = Db::default();
+    db.resolved.push((command_id(1), Resolution::Superseded));
+    db.recovered.push((
+        command_id(1),
+        EntityName::new("reflections").expect("valid entity"),
+        Payload::new(serde_json::json!({ "body": "the user's text" })).expect("valid payload"),
+    ));
+
+    let mut inv = Invariants::new();
+    inv.check_policy(1, &wrap(db), &registry);
+    assert!(inv.holds(), "{:?}", inv.violations());
+}
+
+/// An applied effect that vanished while its verdict remained is caught.
+///
+/// The gap review found: the durability checks inspect only `db.resolved`, so a row that
+/// disappeared while its resolution stayed recorded passed every step. That is the difference
+/// between remembering that a reflection saved and the reflection still being there.
+#[test]
+fn a_vanished_row_is_caught_even_though_its_verdict_remains() {
+    let server = server_with_changes(4);
+    let cursor = server.head();
+
+    let mut db = Db::default();
+    db.cursors.insert(scope(), Cursor::new(cursor).unwrap());
+    // Every row the server holds is present and correct...
+    for (entity, entity_id, version) in server.rows_at(&scope(), cursor) {
+        db.rows.insert(
+            (entity, entity_id),
+            StoredRow {
+                snapshot: credsync_protocol::Snapshot::new(serde_json::json!({ "v": 1 }))
+                    .expect("valid snapshot"),
+                row_version: version,
+                schema_version: schema(),
+            },
+        );
+    }
+
+    let mut inv = Invariants::new();
+    inv.check_durable_effects(1, &wrap(db.clone_for_test()), &server, &scope());
+    assert!(
+        inv.holds(),
+        "the intact case must be silent: {:?}",
+        inv.violations()
+    );
+
+    // ...until one disappears.
+    let mut broken = db;
+    let key = broken.rows.keys().next().cloned().expect("rows exist");
+    broken.rows.remove(&key);
+
+    let mut inv = Invariants::new();
+    inv.check_durable_effects(1, &wrap(broken), &server, &scope());
+
+    assert!(!inv.holds(), "a vanished row was not caught");
+    assert_eq!(inv.violations()[0].invariant, "durable-effects");
+    assert!(inv.violations()[0].detail.contains("absent"));
+}
+
+/// A cursor that disappears from storage is caught.
+///
+/// A regression to nothing, and the worst kind: the device would re-walk the whole log from the
+/// beginning. Returning early on a missing cursor let a reset pass as success.
+#[test]
+fn a_cursor_that_vanishes_is_caught() {
+    let mut inv = Invariants::new();
+    let mut db = Db::default();
+    db.cursors.insert(scope(), Cursor::new(90).unwrap());
+    let dbs = wrap(db);
+
+    inv.check_step(1, &dbs, &scope());
+    assert!(inv.holds());
+
+    dbs[0].borrow_mut().cursors.clear();
+    inv.check_step(2, &dbs, &scope());
+
+    assert!(!inv.holds(), "a vanished cursor was not caught");
+    assert_eq!(inv.violations()[0].invariant, "cursor-monotonicity");
+    assert!(inv.violations()[0].detail.contains("vanished"));
+}

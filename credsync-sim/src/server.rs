@@ -174,6 +174,31 @@ impl Server {
             .max(after)
     }
 
+    /// Every row a client at `cursor` should be holding, with the version it should be at.
+    ///
+    /// The authoritative answer to "what should this device have", which is what makes durable
+    /// *effects* checkable rather than only durable verdicts. A device that recorded a command as
+    /// applied while its row quietly vanished passes every check that inspects only the resolution
+    /// log.
+    #[must_use]
+    pub fn rows_at(&self, scope: &ScopeId, cursor: u64) -> Vec<(EntityName, EntityId, RowVersion)> {
+        let Some(indices) = self.by_scope.get(scope) else {
+            return Vec::new();
+        };
+        let mut latest: BTreeMap<(EntityName, EntityId), RowVersion> = BTreeMap::new();
+        for &i in indices {
+            let e = &self.log[i];
+            if e.seq.get() > cursor {
+                break;
+            }
+            latest.insert(
+                (e.change.entity.clone(), e.change.entity_id.clone()),
+                e.change.row_version,
+            );
+        }
+        latest.into_iter().map(|((e, i), v)| (e, i, v)).collect()
+    }
+
     /// Applies a push, deduping replays and recording every outcome.
     #[must_use]
     pub fn push(&mut self, request: &PushRequest, rng: &mut Rng) -> PushResponse {

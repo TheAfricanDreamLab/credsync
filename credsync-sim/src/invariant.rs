@@ -152,6 +152,19 @@ impl Invariants {
     /// device would report success and stop receiving anything new.
     fn check_cursor_monotonic(&mut self, at_ms: i64, device: usize, db: &Db, scope: &ScopeId) {
         let Some(cursor) = db.cursors.get(scope) else {
+            // A cursor that *disappears* is a regression to nothing, and the worst kind: the
+            // device would re-walk the log from the beginning, re-applying everything. Skipping
+            // the check here would let a cursor reset pass as success.
+            if self.high_water.contains_key(&(device, scope.clone())) {
+                let was = self.high_water[&(device, scope.clone())];
+                self.violations.push(Violation {
+                    invariant: "cursor-monotonicity",
+                    device: Some(device),
+                    detail: format!("cursor reached {was} and then vanished from storage"),
+                    at_ms,
+                });
+                self.high_water.remove(&(device, scope.clone()));
+            }
             return;
         };
         let now = cursor.get();
@@ -188,17 +201,28 @@ impl Invariants {
         let mut this_run: BTreeMap<CommandId, Verdict> = BTreeMap::new();
         for (id, resolution) in &db.resolved {
             let verdict = Verdict::of(resolution);
-            if let Some(prior) = this_run.insert(*id, verdict)
-                && prior != verdict
-            {
-                self.violations.push(Violation {
-                    invariant: "idempotency",
-                    device: Some(device),
-                    detail: format!(
+            if let Some(prior) = this_run.insert(*id, verdict) {
+                // Any repeat, not only a contradictory one. `docs/spec.md` §3.3 gives one result
+                // per submitted command, so one command with two recorded outcomes is wrong even
+                // when the two agree — a user-facing list of dead letters is built from this
+                // count. Limiting the check to differing verdicts made it blind to a duplicated
+                // push result, whose two copies are identical by construction.
+                let detail = if prior == verdict {
+                    format!(
+                        "command {id} recorded twice with the same verdict, {}",
+                        verdict.name()
+                    )
+                } else {
+                    format!(
                         "command {id} recorded twice with different verdicts, {} then {}",
                         prior.name(),
                         verdict.name()
-                    ),
+                    )
+                };
+                self.violations.push(Violation {
+                    invariant: "idempotency",
+                    device: Some(device),
+                    detail,
                     at_ms,
                 });
             }
@@ -307,22 +331,45 @@ impl Invariants {
     ) {
         let expected = server.digest(scope).to_hex();
 
+        let head = server.head();
+
         for (i, db) in databases.iter().enumerate() {
             let db = db.borrow();
+
             let Some(actual) = db.digests.get(scope) else {
-                // A device that never synced anything has nothing to converge to. That is a
-                // quiet device, not a divergent one.
+                // A device with no digest at all has converged to nothing. That is only innocent
+                // when there was nothing to receive: if the server has changes, this device has
+                // been quietly skipped by the check that exists to notice exactly this.
+                if head > 0 {
+                    self.violations.push(Violation {
+                        invariant: "convergence",
+                        device: Some(i),
+                        detail: format!(
+                            "no digest recorded after settling, while the server holds {head} \
+                             changes"
+                        ),
+                        at_ms,
+                    });
+                }
                 continue;
             };
 
-            // Only meaningful once the device has walked the whole log. A device still behind its
-            // cursor is mid-flight, and calling that divergence would make the invariant fire on
-            // normal operation — which is how an invariant gets switched off.
-            let caught_up = db
-                .cursors
-                .get(scope)
-                .is_some_and(|c| c.get() >= server.head());
-            if !caught_up {
+            // Convergence is a claim about where things settle, so a device still mid-log has not
+            // yet had its chance. But "not caught up after settling" is a failure rather than an
+            // exemption — `World::settle` runs a fixed number of steps, so a device that is still
+            // behind is one the run gave up on, and skipping it silently would let the whole run
+            // report success.
+            let cursor = db.cursors.get(scope).map_or(0, |c| c.get());
+            if cursor < head {
+                self.violations.push(Violation {
+                    invariant: "convergence",
+                    device: Some(i),
+                    detail: format!(
+                        "still at cursor {cursor} after settling, with the server at {head}; the \
+                         device never caught up"
+                    ),
+                    at_ms,
+                });
                 continue;
             }
 
@@ -388,6 +435,62 @@ impl Invariants {
                         ),
                         at_ms,
                     });
+                }
+            }
+        }
+    }
+
+    /// **Durable effects.** A row the cursor implies must actually be present.
+    ///
+    /// The verdict checks above inspect only `db.resolved`, so an applied command whose row
+    /// vanished would still pass: the resolution is recorded, and nothing looks at whether the
+    /// *effect* survived. That is the difference between remembering that a student's reflection
+    /// saved and the reflection still being there.
+    ///
+    /// So every row the server holds at or below the device's cursor must exist on the device,
+    /// at the version the cursor implies. Checked continuously.
+    pub fn check_durable_effects(
+        &mut self,
+        at_ms: i64,
+        databases: &[std::rc::Rc<std::cell::RefCell<Db>>],
+        server: &Server,
+        scope: &ScopeId,
+    ) {
+        for (i, db) in databases.iter().enumerate() {
+            let db = db.borrow();
+            let Some(cursor) = db.cursors.get(scope) else {
+                continue;
+            };
+            let cursor = cursor.get();
+
+            for (entity, entity_id, expected) in server.rows_at(scope, cursor) {
+                match db.rows.get(&(entity.clone(), entity_id.clone())) {
+                    Some(stored) if stored.row_version == expected => {}
+                    Some(stored) => {
+                        self.violations.push(Violation {
+                            invariant: "durable-effects",
+                            device: Some(i),
+                            detail: format!(
+                                "{entity}/{entity_id} is at version {} but the cursor {cursor} \
+                                 implies {}",
+                                stored.row_version.get(),
+                                expected.get()
+                            ),
+                            at_ms,
+                        });
+                    }
+                    None => {
+                        self.violations.push(Violation {
+                            invariant: "durable-effects",
+                            device: Some(i),
+                            detail: format!(
+                                "{entity}/{entity_id} should exist at version {} for cursor \
+                                 {cursor}, and is absent — an applied effect was lost",
+                                expected.get()
+                            ),
+                            at_ms,
+                        });
+                    }
                 }
             }
         }
