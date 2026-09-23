@@ -17,7 +17,8 @@
 //! There is no `PatchRow`. `docs/spec.md` §1: snapshots, not diffs; deletes are tombstones.
 
 use credsync_protocol::{
-    Command, Cursor, EntityId, EntityName, HexString, RowVersion, SchemaVersion, ScopeId, Snapshot,
+    Command, CommandId, Cursor, EntityId, EntityName, HexString, Payload, RowVersion,
+    SchemaVersion, ScopeId, Snapshot,
 };
 
 /// One write in a storage transaction.
@@ -83,9 +84,28 @@ pub enum StorageOp {
     /// exactly the failure the outbox exists to prevent.
     ResolveCommand {
         /// Which command was resolved.
-        id: credsync_protocol::CommandId,
+        id: CommandId,
         /// What the host decided.
         resolution: crate::outbox::Resolution,
+    },
+
+    /// Preserve a client edit that lost, so the user can get it back.
+    ///
+    /// `docs/spec.md` §6: for owner drafts, *"the losing version returns to the device and is
+    /// stored as a recovered draft. Silent loss is a protocol violation, not a tradeoff."*
+    ///
+    /// Written whenever a queued command is resolved as `superseded` — the server applied
+    /// last-write-wins and this edit lost. The user's text is in that command's payload and
+    /// exists nowhere else on the device once the entry leaves the outbox, so it is preserved
+    /// here in the **same transaction** that resolves it. Two transactions, and a crash in
+    /// between loses exactly the work this op exists to keep.
+    SaveRecoveredDraft {
+        /// Which entity the edit was for.
+        entity: EntityName,
+        /// The command whose payload this was, so the UI can tie it to what the user did.
+        command_id: CommandId,
+        /// The user's content, exactly as it was submitted.
+        payload: Payload,
     },
 
     /// Append a command to the outbox.

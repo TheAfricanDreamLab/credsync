@@ -33,7 +33,9 @@ use crate::effect::Telemetry;
 use crate::storage::StorageOp;
 use crate::traits::Storage;
 use core::fmt;
-use credsync_protocol::{Batch, Change, EntityId, EntityName, Op, RowVersion, ScopeDigest};
+use credsync_protocol::{
+    Batch, Change, ConflictClass, EntityId, EntityName, Op, RowVersion, ScopeDigest,
+};
 use std::collections::BTreeMap;
 
 use crate::error::StorageError;
@@ -92,6 +94,26 @@ pub enum ApplyError {
         detail: &'static str,
     },
 
+    /// An upsert would overwrite an existing row of an append-only entity.
+    ///
+    /// `docs/spec.md` §6: append-only streams — submissions, attendance events — have *"no
+    /// conflict by construction"* because new versions never overwrite. A server sending a second
+    /// version of an existing row has broken that promise, and the client says so rather than
+    /// quietly accepting it.
+    ///
+    /// Refusing the whole batch is safe here precisely because refusal writes nothing: the client
+    /// stays exactly where it was, so this cannot itself cause the divergence it is reporting.
+    AppendOnlyOverwrite {
+        /// The entity whose contract was broken.
+        entity: EntityName,
+        /// The row that would have been overwritten.
+        entity_id: EntityId,
+        /// The version already stored.
+        stored: u64,
+        /// The version that arrived.
+        incoming: u64,
+    },
+
     /// Storage refused the transaction, so nothing was applied.
     Storage(StorageError),
 }
@@ -113,6 +135,15 @@ impl fmt::Display for ApplyError {
             } => write!(
                 f,
                 "next_cursor {next_cursor} does not cover the last change applied, seq {last_seq}"
+            ),
+            Self::AppendOnlyOverwrite {
+                entity,
+                entity_id,
+                stored,
+                incoming,
+            } => write!(
+                f,
+                "{entity}/{entity_id} is append-only: version {incoming} would overwrite {stored}"
             ),
             Self::Inconsistent { detail } => write!(f, "inconsistent change: {detail}"),
             Self::Storage(e) => write!(f, "storage refused the batch: {e}"),
@@ -220,6 +251,7 @@ pub(crate) type Staged = BTreeMap<(EntityName, EntityId), Option<RowVersion>>;
 pub(crate) fn stage_change<S: Storage>(
     storage: &S,
     change: &Change,
+    class: Option<ConflictClass>,
     digest: &mut ScopeDigest,
     ops: &mut Vec<StorageOp>,
     staged: &mut Staged,
@@ -239,6 +271,22 @@ pub(crate) fn stage_change<S: Storage>(
                     detail: "op=upsert requires a snapshot",
                 });
             };
+
+            // `docs/spec.md` §6: an append-only stream's entries are never replaced. A second
+            // version of a row that already exists means the server broke that contract, which is
+            // worth refusing loudly rather than absorbing. Refusal is safe here precisely because
+            // it writes nothing — the client stays where it was, so this cannot itself cause the
+            // divergence it is reporting.
+            if let (Some(ConflictClass::AppendOnly), Some(old)) = (class, current)
+                && old != change.row_version
+            {
+                return Err(ApplyError::AppendOnlyOverwrite {
+                    entity: change.entity.clone(),
+                    entity_id: change.entity_id.clone(),
+                    stored: old.get(),
+                    incoming: change.row_version.get(),
+                });
+            }
 
             match current {
                 // Replacing a row: subtract the old contribution, add the new one.

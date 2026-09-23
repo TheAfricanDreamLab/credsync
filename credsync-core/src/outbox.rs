@@ -114,6 +114,11 @@ impl OutboxEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OutboxError {
+    /// The registry refused the command before it could be queued.
+    ///
+    /// `docs/spec.md` §6: server-authoritative entities are pull-only, refused by the registry
+    /// rather than by convention.
+    Registry(crate::registry::RegistryError),
     /// Storage refused the transaction, so nothing changed.
     Storage(crate::error::StorageError),
     /// A queued command could not be encoded.
@@ -126,6 +131,7 @@ pub enum OutboxError {
 impl core::fmt::Display for OutboxError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Registry(e) => write!(f, "outbox refused the command: {e}"),
             Self::Storage(e) => write!(f, "outbox storage failure: {e}"),
             Self::Encoding => write!(f, "a queued command could not be encoded"),
         }
@@ -133,6 +139,12 @@ impl core::fmt::Display for OutboxError {
 }
 
 impl core::error::Error for OutboxError {}
+
+impl From<crate::registry::RegistryError> for OutboxError {
+    fn from(e: crate::registry::RegistryError) -> Self {
+        Self::Registry(e)
+    }
+}
 
 impl From<crate::error::StorageError> for OutboxError {
     fn from(e: crate::error::StorageError) -> Self {

@@ -11,13 +11,14 @@
 use crate::apply::{self, Applied, ApplyError};
 use crate::effect::Effect;
 use crate::outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
+use crate::registry::Registry;
 use crate::scope::ScopeState;
 use crate::storage::StorageOp;
 use crate::traits::{Clock, Compressor, Entropy, Storage, Transport};
 use core::fmt;
 use credsync_protocol::{
-    Batch, Command, CommandId, ProtocolVersion, PushRequest, PushResponse, Reason, ScopeId, Status,
-    canonical, limits,
+    Batch, Command, CommandId, ConflictClass, ProtocolVersion, PushRequest, PushResponse, Reason,
+    ScopeId, Status, canonical, limits,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -77,6 +78,12 @@ where
     /// order they were written so a later edit never reaches the host ahead of the earlier one it
     /// depends on.
     outbox: VecDeque<OutboxEntry>,
+    /// What the host declared about its entities and commands.
+    ///
+    /// Data, not a trait: the registry is a table the host fills in, and nothing about it touches
+    /// the outside world. Empty by default, which means an engine accepts no commands until the
+    /// host declares some — the safe direction to fail.
+    registry: Registry,
 }
 
 impl<C, E, S, T, Z> Engine<C, E, S, T, Z>
@@ -88,7 +95,7 @@ where
     Z: Compressor,
 {
     /// Builds an engine over the five supplied implementations.
-    pub const fn new(clock: C, entropy: E, storage: S, transport: T, compressor: Z) -> Self {
+    pub fn new(clock: C, entropy: E, storage: S, transport: T, compressor: Z) -> Self {
         Self {
             clock,
             entropy,
@@ -98,7 +105,19 @@ where
             effects: VecDeque::new(),
             scopes: BTreeMap::new(),
             outbox: VecDeque::new(),
+            registry: Registry::default(),
         }
+    }
+
+    /// The entity and command registry.
+    #[must_use]
+    pub const fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// The registry, for the host to declare entities and commands into.
+    pub const fn registry_mut(&mut self) -> &mut Registry {
+        &mut self.registry
     }
 
     /// Seeds a scope's cursor and digest from what storage holds.
@@ -149,7 +168,17 @@ where
         let mut staged = apply::Staged::new();
 
         for change in &batch.changes {
-            apply::stage_change(&self.storage, change, &mut digest, &mut ops, &mut staged)?;
+            // The class comes from the registry, so append-only enforcement is driven by the
+            // host's declaration rather than by anything hard-coded here.
+            let class = self.registry.class_of(&change.entity);
+            apply::stage_change(
+                &self.storage,
+                change,
+                class,
+                &mut digest,
+                &mut ops,
+                &mut staged,
+            )?;
         }
 
         // The cursor and digest ride in the same transaction as the rows. Not a convenience:
@@ -195,11 +224,21 @@ where
     /// `docs/spec.md` §3.3 and D-004: client writes are **commands, never row writes**. The entry
     /// is persisted before this returns, so a crash immediately afterwards still finds it waiting.
     ///
+    /// The registry is consulted **first**. `docs/spec.md` §6 makes institution truth — grades,
+    /// scores, schedules, statuses — pull-only, *"refused by the registry, not by convention"*.
+    /// Refusing here rather than at the server matters: a client that could queue such a command
+    /// could change its own grade, and a modified client simply would not ask the server's
+    /// permission.
+    ///
     /// # Errors
-    /// Returns [`OutboxError::Storage`] if the entry could not be persisted. Nothing is queued in
-    /// memory in that case — an in-memory entry whose persistence failed is a write the user was
-    /// told was saved and which will vanish at the next launch.
+    /// Returns [`OutboxError::Registry`] if the command is unregistered or targets a
+    /// server-authoritative entity, and [`OutboxError::Storage`] if the entry could not be
+    /// persisted. Nothing is queued in memory in either case — an in-memory entry whose
+    /// persistence failed is a write the user was told was saved and which will vanish at the
+    /// next launch.
     pub fn enqueue(&mut self, entry: OutboxEntry) -> Result<(), OutboxError> {
+        self.registry.check_command(&entry.command)?;
+
         self.storage.transact(&[StorageOp::EnqueueCommand {
             command: entry.command.clone(),
             schema_version: entry.schema_version,
@@ -327,9 +366,16 @@ where
         let mut answered: BTreeSet<CommandId> = BTreeSet::new();
 
         for result in &response.results {
-            if !self.outbox_contains(result.id) || !answered.insert(result.id) {
-                // Already resolved, answered earlier in this same response, or never ours. Either
-                // way there is nothing to do, which is what makes a replayed response harmless.
+            // Found once, up front: the entry carries the command, which is what both the
+            // recovered-draft decision and the registry lookup need.
+            let Some(entry) = self.outbox.iter().find(|e| e.id() == result.id) else {
+                // Already resolved, or never ours. Either way there is nothing to do, which is
+                // what makes a replayed response harmless.
+                unknown += 1;
+                continue;
+            };
+            if !answered.insert(result.id) {
+                // Answered earlier in this same response.
                 unknown += 1;
                 continue;
             }
@@ -338,7 +384,27 @@ where
                 Status::Applied => Resolution::Applied {
                     server_seq: result.server_seq,
                 },
-                Status::Superseded => Resolution::Superseded,
+                Status::Superseded => {
+                    // The server applied last-write-wins and this edit lost. The user's text is
+                    // in this command's payload and exists nowhere else on the device once the
+                    // entry leaves the outbox -- so it is preserved in the SAME transaction that
+                    // resolves it (`docs/spec.md` §6: silent loss is a protocol violation, not a
+                    // tradeoff).
+                    //
+                    // Only for owner drafts. An append-only stream has no draft to recover -- its
+                    // entries are never replaced -- and a server-authoritative entity could never
+                    // have had a command queued against it in the first place.
+                    if let Some(entity) = self.registry.target_of(&entry.command.name)
+                        && self.registry.class_of(entity) == Some(ConflictClass::OwnerDraft)
+                    {
+                        ops.push(StorageOp::SaveRecoveredDraft {
+                            entity: entity.clone(),
+                            command_id: result.id,
+                            payload: entry.command.payload.clone(),
+                        });
+                    }
+                    Resolution::Superseded
+                }
                 Status::Rejected => {
                     // `CommandResult`'s decoder enforces that a rejection carries a reason, but a
                     // response built programmatically can still omit it. Refusing the whole batch
