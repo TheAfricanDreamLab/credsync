@@ -114,7 +114,13 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check licenses
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
+
+**`RUSTDOCFLAGS`, not `RUSTFLAGS`.** Cargo forwards `RUSTFLAGS` to rustc and *not* to rustdoc, so
+`-D warnings` alone leaves every rustdoc lint — broken intra-doc links included — a warning that
+exits 0. CI carried a `cargo doc` step from CS-1 that had never once failed a build, and a broken
+link lived on `main` from CS-3 to CS-10 with every pull request green (#44).
 
 From CS-6 onward, also:
 
