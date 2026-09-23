@@ -302,25 +302,46 @@ where
 
         let mut chosen: Vec<Command> = Vec::new();
 
+        // The candidate batch's canonical bytes, grown in place. Starts as the empty array.
+        //
+        // Each command is encoded **once** and appended; the previous implementation cloned the
+        // chosen list and re-encoded all of it on every iteration, which is O(n^2) bytes of JSON
+        // serialisation to fill a batch of n (#53). That cost landed exactly where there is least
+        // budget for it: `docs/spec.md` §3.2's headline case is a three-week-offline device, which
+        // is a device with a *large* outbox, on the worst link, with the slowest processor.
+        //
+        // Splicing in place rather than building a fresh candidate each time is what keeps it
+        // linear — a rejected command is rolled back by truncating, which is O(1).
+        let mut buf: Vec<u8> = vec![b'[', b']'];
+
         for entry in &self.outbox {
             if chosen.len() >= limits::COMMANDS_MAX_COUNT {
                 break;
             }
 
-            let mut candidate = chosen.clone();
-            candidate.push(entry.command.clone());
+            let one = canonical::to_vec(&entry.command).map_err(|_| OutboxError::Encoding)?;
 
-            let encoded = canonical::to_vec(&candidate).map_err(|_| OutboxError::Encoding)?;
-            if encoded.len() > limits::COMMANDS_MAX_TOTAL_BYTES && !chosen.is_empty() {
+            // Splice `one` in before the closing bracket: `[a,b]` + c -> `[a,b,c]`.
+            let rollback = buf.len();
+            buf.pop();
+            if !chosen.is_empty() {
+                buf.push(b',');
+            }
+            buf.extend_from_slice(&one);
+            buf.push(b']');
+
+            let too_many_bytes = buf.len() > limits::COMMANDS_MAX_TOTAL_BYTES;
+            let over_budget = self.compressor.compressed_len(&buf) > budget_bytes;
+
+            // One command always goes, even alone over budget: see the method docs. Otherwise a
+            // single oversized entry wedges the outbox permanently.
+            if (too_many_bytes || over_budget) && !chosen.is_empty() {
+                buf.truncate(rollback - 1);
+                buf.push(b']');
                 break;
             }
 
-            let compressed = self.compressor.compressed_len(&encoded);
-            if compressed > budget_bytes && !chosen.is_empty() {
-                break;
-            }
-
-            chosen = candidate;
+            chosen.push(entry.command.clone());
         }
 
         Ok(Some(PushRequest {

@@ -269,6 +269,11 @@ impl Storage for SharedStorage {
 pub struct FakeCompressor {
     pub divisor: usize,
     pub calls: Rc<Cell<usize>>,
+    /// The last buffer this compressor was asked to measure.
+    ///
+    /// `build_push` hands it the real candidate bytes, so recording them is how a test checks
+    /// that the incrementally spliced buffer matches a whole-list encode (#53).
+    pub last_seen: Rc<RefCell<Vec<u8>>>,
 }
 
 impl FakeCompressor {
@@ -277,6 +282,7 @@ impl FakeCompressor {
         Self {
             divisor: divisor.max(1),
             calls: Rc::new(Cell::new(0)),
+            last_seen: Rc::new(RefCell::new(Vec::new())),
         }
     }
 }
@@ -290,6 +296,8 @@ impl Default for FakeCompressor {
 impl Compressor for FakeCompressor {
     fn compressed_len(&self, bytes: &[u8]) -> usize {
         self.calls.set(self.calls.get() + 1);
+        self.last_seen.borrow_mut().clear();
+        self.last_seen.borrow_mut().extend_from_slice(bytes);
         bytes.len().div_ceil(self.divisor)
     }
 }

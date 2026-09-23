@@ -24,6 +24,16 @@ use credsync_protocol::{
 };
 use std::collections::BTreeMap;
 
+/// Identifies one row: `(entity, entity_id)`. Unique because the registry maps each entity to
+/// exactly one scope (`docs/spec.md` §1).
+type RowKey = (EntityName, EntityId);
+
+/// Every version one row has held, in `seq` order.
+type RowVersions = Vec<(u64, RowVersion)>;
+
+/// Per scope, per row, that row's full version history.
+type RowHistory = BTreeMap<ScopeId, BTreeMap<RowKey, RowVersions>>;
+
 /// One entry in the append-only change log.
 #[derive(Debug, Clone)]
 struct LogEntry {
@@ -54,7 +64,17 @@ pub struct Server {
     /// its cursor instead of scanning.
     by_scope: BTreeMap<ScopeId, Vec<usize>>,
     /// Live rows per scope, keyed by `(entity, entity_id)`.
-    rows: BTreeMap<ScopeId, BTreeMap<(EntityName, EntityId), RowVersion>>,
+    rows: BTreeMap<ScopeId, BTreeMap<RowKey, RowVersion>>,
+    /// Per row, every version it has held, in `seq` order.
+    ///
+    /// The invariants ask "what should this device hold at cursor C" after **every step**, for
+    /// every device. Answering that by walking the scope's whole log made the check O(log length)
+    /// per device per step — the simulator went from 1 second per seed to 12, which turns a
+    /// thousand-seed batch from twenty minutes into three and a half hours.
+    ///
+    /// A scope holds a handful of rows, so this turns the same question into a binary search per
+    /// row: O(rows x log history) instead.
+    row_history: RowHistory,
     dedupe: BTreeMap<CommandId, DedupeEntry>,
     next_seq: u64,
     /// Which entity each command name writes, mirroring the client's registry.
@@ -73,6 +93,7 @@ impl Server {
             log: Vec::new(),
             by_scope: BTreeMap::new(),
             rows: BTreeMap::new(),
+            row_history: BTreeMap::new(),
             dedupe: BTreeMap::new(),
             next_seq: 1,
             command_targets: BTreeMap::new(),
@@ -182,21 +203,18 @@ impl Server {
     /// log.
     #[must_use]
     pub fn rows_at(&self, scope: &ScopeId, cursor: u64) -> Vec<(EntityName, EntityId, RowVersion)> {
-        let Some(indices) = self.by_scope.get(scope) else {
+        let Some(history) = self.row_history.get(scope) else {
             return Vec::new();
         };
-        let mut latest: BTreeMap<(EntityName, EntityId), RowVersion> = BTreeMap::new();
-        for &i in indices {
-            let e = &self.log[i];
-            if e.seq.get() > cursor {
-                break;
-            }
-            latest.insert(
-                (e.change.entity.clone(), e.change.entity_id.clone()),
-                e.change.row_version,
-            );
-        }
-        latest.into_iter().map(|((e, i), v)| (e, i, v)).collect()
+        history
+            .iter()
+            .filter_map(|((entity, entity_id), versions)| {
+                // The last entry at or below the cursor, found by binary search rather than by
+                // walking: this runs for every row, every device, every step.
+                let idx = versions.partition_point(|(seq, _)| *seq <= cursor);
+                (idx > 0).then(|| (entity.clone(), entity_id.clone(), versions[idx - 1].1))
+            })
+            .collect()
     }
 
     /// The version a row should hold on a client whose cursor is at `cursor`.
@@ -361,6 +379,12 @@ impl Server {
             .entry(scope.clone())
             .or_default()
             .push(self.log.len());
+        self.row_history
+            .entry(scope.clone())
+            .or_default()
+            .entry((entity.clone(), entity_id.clone()))
+            .or_default()
+            .push((seq.get(), row_version));
         self.log.push(LogEntry {
             seq,
             change: Change {

@@ -402,3 +402,91 @@ fn a_rejection_without_a_reason_is_still_dead_lettered() {
         other => panic!("expected a dead letter, got {other:?}"),
     });
 }
+
+// -------------------------------------------------------------------------------------------
+// #53 — build_push is linear in the number of queued commands
+// -------------------------------------------------------------------------------------------
+
+/// The spliced buffer is byte-identical to encoding the whole list at once.
+///
+/// `build_push` grows the candidate batch's canonical bytes in place rather than re-encoding the
+/// list on every iteration. That is only safe if the two agree exactly — the budget is measured
+/// over those bytes, so a splice that produced even slightly different output would mean batches
+/// sized against something that never goes on the wire.
+///
+/// Checked through the compressor, which is handed the real buffer: it records what it was given,
+/// and the test compares that against a from-scratch encode of the chosen commands.
+#[test]
+fn the_incrementally_built_bytes_match_a_from_scratch_encode() {
+    let recorder = FakeCompressor::with_ratio(1);
+    let seen = recorder.last_seen.clone();
+    let (mut engine, _storage) = new_engine_with(recorder);
+
+    for n in 1..=12 {
+        engine.enqueue(entry(n, 20)).expect("enqueues");
+    }
+
+    let push = engine
+        .build_push(protocol(), usize::MAX)
+        .expect("builds")
+        .expect("something to send");
+
+    let from_scratch = credsync_protocol::canonical::to_vec(&push.commands).expect("encodes");
+    let spliced = seen.borrow().clone();
+
+    assert_eq!(
+        String::from_utf8_lossy(&spliced),
+        String::from_utf8_lossy(&from_scratch),
+        "the incrementally spliced bytes drifted from a whole-list encode"
+    );
+}
+
+/// Building a push is linear in the size of the batch, not quadratic.
+///
+/// Found by the simulator (#53). The previous implementation cloned the chosen list and
+/// re-encoded all of it per entry, so filling a batch of *n* performed *n* encodings averaging
+/// *n/2*. The loop breaks at `COMMANDS_MAX_COUNT`, so *n* is capped at 256 — this was never
+/// unbounded — but 256 squared is still ~65,000 command-encodings per push attempt, paid on every
+/// attempt including the ones that fail and get retried.
+///
+/// Measured on a 2019 x86 laptop, 20 builds of a full batch with 200-byte payloads:
+///
+/// ```text
+///                32 queued      300 queued (256 chosen)     ratio
+///   before          58 ms             4,739 ms               81x
+///   after          6.3 ms                43 ms              6.8x
+/// ```
+///
+/// Eight times the commands for eight times the work is linear; for eighty is not. The threshold
+/// below sits between the two with room for a loaded CI runner, because this guards against a
+/// return to quadratic rather than policing constant factors.
+#[test]
+#[cfg_attr(miri, ignore = "times a loop; meaningless under an interpreter")]
+fn building_a_push_is_linear_in_batch_size() {
+    fn time_with(count: usize) -> std::time::Duration {
+        let (mut engine, _storage) = new_engine();
+        for n in 0..count {
+            engine
+                .enqueue(entry(u8::try_from(n % 250).unwrap_or(0), 200))
+                .expect("enqueues");
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            engine.build_push(protocol(), usize::MAX).expect("builds");
+        }
+        started.elapsed()
+    }
+
+    // Warm the allocator and the code path so the first measurement is not the outlier.
+    let _ = time_with(16);
+
+    let small = time_with(32);
+    let large = time_with(300);
+
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::EPSILON);
+    assert!(
+        ratio < 30.0,
+        "roughly 8x the commands took {ratio:.1}x the time ({small:?} -> {large:?}); \
+         the quadratic shape #53 removed measured 81x here"
+    );
+}
