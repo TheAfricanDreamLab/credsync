@@ -3,7 +3,7 @@
 //! # The sans-IO rule
 //!
 //! This crate performs **no I/O and never consults the real world**. Everything that touches
-//! reality arrives through four traits — [`Clock`], [`Entropy`], [`Storage`] and [`Transport`] —
+//! reality arrives through four traits — [`Clock`], [`Entropy`], [`Storage`], [`Transport`] and [`Compressor`] —
 //! supplied by the caller.
 //!
 //! In production those are real implementations. In [`credsync_sim`] they are seeded fakes. The
@@ -18,7 +18,7 @@
 //! ```text
 //!   Event  ──▶  Engine  ──▶  Effect
 //!                 │
-//!                 └── holds Clock, Entropy, Storage, Transport
+//!                 └── holds Clock, Entropy, Storage, Transport, Compressor
 //! ```
 //!
 //! Events go in; effects come out; the four implementations are held by the engine and used by it
@@ -58,6 +58,7 @@ pub mod effect;
 pub mod engine;
 pub mod error;
 pub mod event;
+pub mod outbox;
 pub mod scope;
 pub mod storage;
 pub mod traits;
@@ -69,8 +70,9 @@ pub use effect::{Effect, Telemetry};
 pub use engine::Engine;
 pub use error::{StorageError, TransportError};
 pub use event::Event;
+pub use outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
 pub use scope::ScopeState;
 pub use storage::{StorageOp, TxOutcome};
-pub use traits::{Clock, Entropy, Storage, Transport};
+pub use traits::{Clock, Compressor, Entropy, Storage, Transport};
 pub use types::{RequestId, Timestamp};
 pub use wire::{WireRequest, WireResponse};

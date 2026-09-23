@@ -72,6 +72,22 @@ pub enum StorageOp {
         /// The digest, 32 lowercase hex characters.
         digest: HexString,
     },
+    /// Remove an outbox entry **and record why**, in one transaction.
+    ///
+    /// The only way an entry leaves the outbox. There is deliberately no `DeleteCommand` op:
+    /// "never silently dropped" (`docs/spec.md` §3.3) is enforced by there being no operation
+    /// that could drop one, rather than by every adapter remembering not to.
+    ///
+    /// Both halves must commit together. An entry removed without its outcome recorded is a
+    /// write the user was told would be saved, gone with no trace and no explanation — which is
+    /// exactly the failure the outbox exists to prevent.
+    ResolveCommand {
+        /// Which command was resolved.
+        id: credsync_protocol::CommandId,
+        /// What the host decided.
+        resolution: crate::outbox::Resolution,
+    },
+
     /// Append a command to the outbox.
     ///
     /// `schema_version` is recorded with it because `docs/spec.md` §7 requires that an upgraded

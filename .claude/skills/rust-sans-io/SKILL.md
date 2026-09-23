@@ -140,9 +140,23 @@ let current = match staged.get(&key) {
 };
 ```
 
-Any future slice that stages multi-op transactions — the outbox at CS-8, migrations at CS-20 —
-needs the same discipline. If your staging logic reads state that your own ops are about to
-change, it must read the overlay first.
+Any future slice that stages multi-op transactions — migrations at CS-20, the server's dedupe
+table at CS-15 — needs the same discipline. If your staging logic reads state that your own ops
+are about to change, it must read the overlay first.
+
+**It happened again at CS-8, one slice later**, in a different shape. `apply_results` checked
+`outbox_contains` per result, but the in-memory outbox is not pruned until the commit succeeds —
+so a response naming the same command twice resolved it twice and recorded two outcomes. With
+differing verdicts, which one stuck depended on write order: a dead letter for a command the host
+actually applied, or an "applied" masking a rejection the user needed to see.
+
+Both bugs were found by property tests, neither by review, and neither by the unit tests written
+alongside the feature. The tell is the same each time:
+
+> A loop that consults committed state while building a batch that will change it.
+
+When you write one, ask what the second iteration sees. If the answer is "the state from before
+the loop started", you need an overlay or a seen-set.
 
 ## Testing this layer
 

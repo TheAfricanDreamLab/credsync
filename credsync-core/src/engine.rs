@@ -1,18 +1,25 @@
-//! The state machine itself — at CS-6, its shape and nothing more.
+//! The state machine itself.
 //!
-//! State transitions arrive at CS-7 (#8) onward. There is deliberately no `handle` method yet: a
-//! `handle` that accepted an [`Event`](crate::Event) and did nothing would compile, look
-//! finished, and quietly swallow every event fed to it. An absent method is a compile error at
-//! the call site, which is the failure anyone would rather have.
+//! Shape at CS-6, the pull apply path at CS-7, the outbox at CS-8.
+//!
+//! There is still deliberately no `handle` method. Event routing arrives with the slice that
+//! needs the full sync loop; a `handle` matching only the events implemented so far, while
+//! silently ignoring the rest, would compile, look finished, and swallow everything it did not
+//! recognise. An absent method is a compile error at the call site, which is the failure anyone
+//! would rather have.
 
 use crate::apply::{self, Applied, ApplyError};
 use crate::effect::Effect;
+use crate::outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
 use crate::scope::ScopeState;
 use crate::storage::StorageOp;
-use crate::traits::{Clock, Entropy, Storage, Transport};
+use crate::traits::{Clock, Compressor, Entropy, Storage, Transport};
 use core::fmt;
-use credsync_protocol::{Batch, ScopeId};
-use std::collections::{BTreeMap, VecDeque};
+use credsync_protocol::{
+    Batch, Command, CommandId, ProtocolVersion, PushRequest, PushResponse, Reason, ScopeId, Status,
+    canonical, limits,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The credSync client state machine.
 ///
@@ -24,10 +31,10 @@ use std::collections::{BTreeMap, VecDeque};
 /// This is not caution about concurrency — it is a constraint the consumers actually impose.
 /// Hermes, React Native's JavaScript engine, is single-threaded; a `Send` bound here would force
 /// every binding to wrap its SQLite handle in a mutex to satisfy a requirement the design never
-/// had. `tests/single_threaded.rs` constructs this engine from four deliberately `!Send` parts,
+/// had. `tests/single_threaded.rs` constructs this engine from five deliberately `!Send` parts,
 /// so adding such a bound stops compiling rather than merely becoming regrettable.
 ///
-/// # Why it owns all four traits
+/// # Why it owns all five traits
 ///
 /// Design v2.1 §4.1 describes storage results arriving as events, which would put `Storage`
 /// outside the engine. It is held here instead (D-037): `Storage::transact` answers immediately,
@@ -35,17 +42,23 @@ use std::collections::{BTreeMap, VecDeque};
 /// across a round trip — the exact state that must never be interruptible. `Transport` differs
 /// and is answered by [`Event::TransportResponse`](crate::Event::TransportResponse), because a
 /// request handed to the network is answered later or never.
-pub struct Engine<C, E, S, T>
+///
+/// [`Compressor`] joined them at CS-8 (D-042). `docs/spec.md` §2 makes byte budgets
+/// compressed-size budgets and negotiates the algorithm on the wire, so the core must be told how
+/// large a batch will actually be rather than guess.
+pub struct Engine<C, E, S, T, Z>
 where
     C: Clock,
     E: Entropy,
     S: Storage,
     T: Transport,
+    Z: Compressor,
 {
     clock: C,
     entropy: E,
     storage: S,
     transport: T,
+    compressor: Z,
     /// Queued for the caller to drain. Ordered: effect order is part of the engine's observable
     /// behaviour, and the simulator asserts two runs of one seed produce the same stream.
     effects: VecDeque<Effect>,
@@ -58,24 +71,33 @@ where
     /// this sort of quiet way. The workspace denies `clippy::iter_over_hash_type` for the same
     /// reason.
     scopes: BTreeMap<ScopeId, ScopeState>,
+    /// Commands waiting for the server to say what happened to them.
+    ///
+    /// A queue, not a set: `docs/spec.md` §4 pushes before it pulls, and commands are sent in the
+    /// order they were written so a later edit never reaches the host ahead of the earlier one it
+    /// depends on.
+    outbox: VecDeque<OutboxEntry>,
 }
 
-impl<C, E, S, T> Engine<C, E, S, T>
+impl<C, E, S, T, Z> Engine<C, E, S, T, Z>
 where
     C: Clock,
     E: Entropy,
     S: Storage,
     T: Transport,
+    Z: Compressor,
 {
-    /// Builds an engine over the four supplied implementations.
-    pub const fn new(clock: C, entropy: E, storage: S, transport: T) -> Self {
+    /// Builds an engine over the five supplied implementations.
+    pub const fn new(clock: C, entropy: E, storage: S, transport: T, compressor: Z) -> Self {
         Self {
             clock,
             entropy,
             storage,
             transport,
+            compressor,
             effects: VecDeque::new(),
             scopes: BTreeMap::new(),
+            outbox: VecDeque::new(),
         }
     }
 
@@ -168,6 +190,199 @@ where
         })
     }
 
+    /// Queues a client write.
+    ///
+    /// `docs/spec.md` §3.3 and D-004: client writes are **commands, never row writes**. The entry
+    /// is persisted before this returns, so a crash immediately afterwards still finds it waiting.
+    ///
+    /// # Errors
+    /// Returns [`OutboxError::Storage`] if the entry could not be persisted. Nothing is queued in
+    /// memory in that case — an in-memory entry whose persistence failed is a write the user was
+    /// told was saved and which will vanish at the next launch.
+    pub fn enqueue(&mut self, entry: OutboxEntry) -> Result<(), OutboxError> {
+        self.storage.transact(&[StorageOp::EnqueueCommand {
+            command: entry.command.clone(),
+            schema_version: entry.schema_version,
+        }])?;
+        self.outbox.push_back(entry);
+        Ok(())
+    }
+
+    /// Restores queued commands from storage at startup.
+    ///
+    /// Order matters and is the caller's to preserve: commands are pushed in the order they were
+    /// written, so a later edit never reaches the host before the earlier one it depends on.
+    pub fn restore_outbox(&mut self, entries: impl IntoIterator<Item = OutboxEntry>) {
+        self.outbox.extend(entries);
+    }
+
+    /// How many commands are waiting.
+    #[must_use]
+    pub fn outbox_len(&self) -> usize {
+        self.outbox.len()
+    }
+
+    /// Whether a command is still queued.
+    #[must_use]
+    pub fn outbox_contains(&self, id: CommandId) -> bool {
+        self.outbox.iter().any(|e| e.id() == id)
+    }
+
+    /// Builds the next push request, filling it up to the compressed byte budget.
+    ///
+    /// Returns `None` when the outbox is empty.
+    ///
+    /// # How the budget is applied
+    ///
+    /// `docs/spec.md` §2 makes byte budgets **compressed-size budgets**, so each candidate batch
+    /// is encoded canonically and measured through the injected [`Compressor`] — never counted in
+    /// rows. Highly compressible payloads therefore travel in larger batches, which is the whole
+    /// point on a link where bytes are the scarce resource rather than round trips.
+    ///
+    /// Three limits bind, whichever comes first: the compressed budget, the 256-entry cap and the
+    /// 1 MB uncompressed cap from `docs/spec.md` §2.1. The last two are the server's limits, so
+    /// exceeding them produces a refusal rather than a slow request.
+    ///
+    /// **One command always goes, even if it exceeds the budget alone.** A single oversized entry
+    /// that could never fit would otherwise wedge the outbox permanently — nothing sent, nothing
+    /// resolved, and every later write stuck behind it. The same rule `docs/spec.md` §2 states for
+    /// pull batches: *"a single change larger than the budget is still delivered alone rather
+    /// than stalling the cursor."*
+    ///
+    /// # Errors
+    /// Returns [`OutboxError::Encoding`] if a queued command cannot be encoded, which would mean
+    /// a value that passed validation on the way in has since become unrepresentable.
+    pub fn build_push(
+        &self,
+        protocol: ProtocolVersion,
+        budget_bytes: usize,
+    ) -> Result<Option<PushRequest>, OutboxError> {
+        if self.outbox.is_empty() {
+            return Ok(None);
+        }
+
+        let mut chosen: Vec<Command> = Vec::new();
+
+        for entry in &self.outbox {
+            if chosen.len() >= limits::COMMANDS_MAX_COUNT {
+                break;
+            }
+
+            let mut candidate = chosen.clone();
+            candidate.push(entry.command.clone());
+
+            let encoded = canonical::to_vec(&candidate).map_err(|_| OutboxError::Encoding)?;
+            if encoded.len() > limits::COMMANDS_MAX_TOTAL_BYTES && !chosen.is_empty() {
+                break;
+            }
+
+            let compressed = self.compressor.compressed_len(&encoded);
+            if compressed > budget_bytes && !chosen.is_empty() {
+                break;
+            }
+
+            chosen = candidate;
+        }
+
+        Ok(Some(PushRequest {
+            protocol,
+            commands: chosen,
+        }))
+    }
+
+    /// Applies the server's verdicts, resolving each command it answered.
+    ///
+    /// # Idempotent by construction
+    ///
+    /// A result for a command that is no longer queued is ignored. Replays are ordinary here —
+    /// a retried push after a timeout returns the same results a second time — so re-resolving
+    /// must change nothing rather than double-count or error.
+    ///
+    /// # What is deliberately *not* done
+    ///
+    /// A command with **no** result stays queued. The server answered about others and said
+    /// nothing about this one, which is not permission to discard it. This is the single most
+    /// important line in the outbox: silent loss is a protocol violation, not a tradeoff (D-009).
+    ///
+    /// # Errors
+    /// Returns [`OutboxError::Storage`] if the resolutions could not be committed. Nothing is
+    /// removed from the in-memory outbox in that case, so the push is simply retried.
+    pub fn apply_results(&mut self, response: &PushResponse) -> Result<Resolved, OutboxError> {
+        let mut ops: Vec<StorageOp> = Vec::new();
+        let mut resolutions: Vec<(CommandId, Resolution)> = Vec::new();
+        let mut unknown = 0usize;
+
+        // Ids this response has already answered. The in-memory outbox is not pruned until the
+        // commit succeeds, so `outbox_contains` alone would let a response naming the same
+        // command twice resolve it twice.
+        //
+        // That is not cosmetic. Two verdicts for one command produce two records, and if they
+        // disagree the stored outcome depends on write order: a dead letter recorded for a
+        // command the host actually applied, or an "applied" masking a real rejection the user
+        // needed to see. First answer wins; later repeats are noise.
+        //
+        // Found by `tests/outbox_property.rs`, and it is the same shape as the CS-7 staging bug
+        // (D-041) — logic that reads state its own in-progress batch is about to change. See
+        // `.claude/skills/rust-sans-io/SKILL.md`, "Staging a transaction: read your own writes".
+        let mut answered: BTreeSet<CommandId> = BTreeSet::new();
+
+        for result in &response.results {
+            if !self.outbox_contains(result.id) || !answered.insert(result.id) {
+                // Already resolved, answered earlier in this same response, or never ours. Either
+                // way there is nothing to do, which is what makes a replayed response harmless.
+                unknown += 1;
+                continue;
+            }
+
+            let resolution = match result.status {
+                Status::Applied => Resolution::Applied {
+                    server_seq: result.server_seq,
+                },
+                Status::Superseded => Resolution::Superseded,
+                Status::Rejected => {
+                    // `CommandResult`'s decoder enforces that a rejection carries a reason, but a
+                    // response built programmatically can still omit it. Refusing the whole batch
+                    // over one malformed result would strand every other command in it, so the
+                    // entry is dead-lettered with a stated fallback instead — dead-lettering with
+                    // an unhelpful reason is recoverable, dropping the entry is not.
+                    let reason = result.reason.clone().unwrap_or_else(|| {
+                        Reason::new("Rejected by the server without a stated reason.")
+                            .unwrap_or_else(|_| unreachable!("literal is a valid reason"))
+                    });
+                    Resolution::DeadLettered { reason }
+                }
+            };
+
+            ops.push(StorageOp::ResolveCommand {
+                id: result.id,
+                resolution: resolution.clone(),
+            });
+            resolutions.push((result.id, resolution));
+        }
+
+        if ops.is_empty() {
+            return Ok(Resolved {
+                resolutions,
+                unknown,
+            });
+        }
+
+        // Every resolution commits together, and only then does the in-memory queue shrink.
+        // Reversed, a failed commit would leave commands gone from memory and still pending in
+        // storage: resurrected at the next launch and pushed again, which the server would dedupe
+        // -- but the user's dead-letter would have silently vanished in the meantime.
+        self.storage.transact(&ops)?;
+
+        for (id, _) in &resolutions {
+            self.outbox.retain(|e| e.id() != *id);
+        }
+
+        Ok(Resolved {
+            resolutions,
+            unknown,
+        })
+    }
+
     /// Takes the next queued effect, oldest first.
     ///
     /// Returns `None` when the queue is empty, which is the normal resting state — an engine with
@@ -185,20 +400,21 @@ where
 
 /// The handles the transitions will reach for.
 ///
-/// `dead_code` is allowed here, and only here, because CS-6 is explicitly a skeleton: the issue
-/// puts every state transition in CS-7 (#8) and later. The accessors exist now so the four
-/// implementations are *stored* now, which is what fixes the struct's bounds — and fixing them
-/// now is the point of the slice, since `tests/single_threaded.rs` asserts against exactly these
-/// bounds.
+/// `dead_code` is allowed here because `Clock`, `Entropy` and `Transport` have no caller yet:
+/// time enters through `Event::Tick`, entropy is first needed when the client mints its own
+/// command ids, and requests are handed to the transport by the sync loop. `Storage` and
+/// `Compressor` are used directly by `apply_batch` and `build_push` and need no accessor.
 ///
-/// If this attribute is still here once transitions exist, it is stale and should go.
+/// Each remaining accessor should lose this allowance as its slice arrives. If the attribute
+/// outlives all three, it is stale and should go.
 #[allow(dead_code)]
-impl<C, E, S, T> Engine<C, E, S, T>
+impl<C, E, S, T, Z> Engine<C, E, S, T, Z>
 where
     C: Clock,
     E: Entropy,
     S: Storage,
     T: Transport,
+    Z: Compressor,
 {
     /// Queues an effect for the caller.
     ///
@@ -232,16 +448,18 @@ where
 // bounds, so a caller whose SQLite handle is not `Debug` could not debug-print the engine. The
 // four implementations are also the least interesting thing about it — what a reader wants is
 // how much work is outstanding.
-impl<C, E, S, T> fmt::Debug for Engine<C, E, S, T>
+impl<C, E, S, T, Z> fmt::Debug for Engine<C, E, S, T, Z>
 where
     C: Clock,
     E: Entropy,
     S: Storage,
     T: Transport,
+    Z: Compressor,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Engine")
             .field("pending_effects", &self.effects.len())
+            .field("outbox", &self.outbox.len())
             .finish_non_exhaustive()
     }
 }

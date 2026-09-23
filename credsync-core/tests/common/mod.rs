@@ -8,11 +8,14 @@
 
 #![allow(dead_code, unreachable_pub)]
 
-use credsync_core::{Clock, Entropy, Transport, TransportError, WireRequest};
+use credsync_core::{
+    Clock, Compressor, Entropy, OutboxEntry, Transport, TransportError, WireRequest,
+};
 use credsync_core::{RequestId, Storage, StorageError, StorageOp, Timestamp, TxOutcome};
 use credsync_protocol::{
-    Batch, Change, Cursor, EntityId, EntityName, HexString, Op, RowVersion, SchemaVersion,
-    ScopeDigest, ScopeId, Seq, Snapshot,
+    Batch, Change, Command, CommandId, CommandName, CommandResult, Cursor, EntityId, EntityName,
+    HexString, Op, Payload, ProtocolVersion, PushResponse, Reason, RowVersion, SchemaVersion,
+    ScopeDigest, ScopeId, Seq, Snapshot, Status,
 };
 use serde_json::json;
 use std::cell::{Cell, RefCell};
@@ -45,6 +48,10 @@ pub struct FakeStorage {
     pub fail_next: Option<StorageError>,
     /// When set, the next read fails.
     pub fail_read: Option<StorageError>,
+    /// Outbox entries, in the order they were enqueued.
+    pub queued: Vec<(CommandId, SchemaVersion)>,
+    /// Recorded outcomes, in resolution order.
+    pub resolved: Vec<(CommandId, credsync_core::Resolution)>,
 }
 
 impl FakeStorage {
@@ -93,17 +100,18 @@ impl FakeStorage {
     }
 
     /// Applies ops to a snapshot of state, returning the new state.
-    fn staged(
-        &self,
-        ops: &[StorageOp],
-    ) -> (
-        BTreeMap<RowKey, StoredRow>,
-        BTreeMap<ScopeId, Cursor>,
-        BTreeMap<ScopeId, HexString>,
-    ) {
-        let mut rows = self.rows.clone();
-        let mut cursors = self.cursors.clone();
-        let mut digests = self.digests.clone();
+    ///
+    /// Everything a transaction touches is staged here — rows, cursors, digests, and the outbox —
+    /// so a rollback discards all of it together. Leaving the outbox out would make the atomicity
+    /// tests pass while the very writes the outbox exists to protect were committed early.
+    fn staged(&self, ops: &[StorageOp]) -> Snapshotted {
+        let mut s = Snapshotted {
+            rows: self.rows.clone(),
+            cursors: self.cursors.clone(),
+            digests: self.digests.clone(),
+            queued: self.queued.clone(),
+            resolved: self.resolved.clone(),
+        };
 
         for op in ops {
             match op {
@@ -114,7 +122,7 @@ impl FakeStorage {
                     row_version,
                     schema_version,
                 } => {
-                    rows.insert(
+                    s.rows.insert(
                         (entity.clone(), entity_id.clone()),
                         StoredRow {
                             snapshot: snapshot.clone(),
@@ -124,21 +132,40 @@ impl FakeStorage {
                     );
                 }
                 StorageOp::DeleteRow { entity, entity_id } => {
-                    rows.remove(&(entity.clone(), entity_id.clone()));
+                    s.rows.remove(&(entity.clone(), entity_id.clone()));
                 }
                 StorageOp::SetCursor { scope, cursor } => {
-                    cursors.insert(scope.clone(), *cursor);
+                    s.cursors.insert(scope.clone(), *cursor);
                 }
                 StorageOp::SetScopeDigest { scope, digest } => {
-                    digests.insert(scope.clone(), digest.clone());
+                    s.digests.insert(scope.clone(), digest.clone());
                 }
-                StorageOp::EnqueueCommand { .. } => {}
+                StorageOp::EnqueueCommand {
+                    command,
+                    schema_version,
+                } => {
+                    s.queued.push((command.id, *schema_version));
+                }
+                StorageOp::ResolveCommand { id, resolution } => {
+                    s.queued.retain(|(qid, _)| qid != id);
+                    s.resolved.push((*id, resolution.clone()));
+                }
                 _ => {}
             }
         }
 
-        (rows, cursors, digests)
+        s
     }
+}
+
+/// A full snapshot of everything a transaction can touch.
+#[derive(Debug, Clone)]
+pub struct Snapshotted {
+    rows: BTreeMap<RowKey, StoredRow>,
+    cursors: BTreeMap<ScopeId, Cursor>,
+    digests: BTreeMap<ScopeId, HexString>,
+    queued: Vec<(CommandId, SchemaVersion)>,
+    resolved: Vec<(CommandId, credsync_core::Resolution)>,
 }
 
 impl Storage for FakeStorage {
@@ -147,16 +174,18 @@ impl Storage for FakeStorage {
 
         // Staged first, exactly as a real transaction would be, so a rollback discards work that
         // really was performed rather than work that was never attempted.
-        let (rows, cursors, digests) = self.staged(ops);
+        let staged = self.staged(ops);
 
         if let Some(e) = self.fail_next.take() {
             // Rolled back: the staged state is dropped here, untouched by the fields below.
             return Err(e);
         }
 
-        self.rows = rows;
-        self.cursors = cursors;
-        self.digests = digests;
+        self.rows = staged.rows;
+        self.cursors = staged.cursors;
+        self.digests = staged.digests;
+        self.queued = staged.queued;
+        self.resolved = staged.resolved;
         self.commits += 1;
         Ok(TxOutcome::new(ops.len()))
     }
@@ -213,6 +242,41 @@ impl Storage for SharedStorage {
         entity_id: &EntityId,
     ) -> Result<Option<RowVersion>, StorageError> {
         self.0.borrow().row_version(entity, entity_id)
+    }
+}
+
+/// A compressor that divides, so a test can ask for a given compression ratio.
+///
+/// `divisor` of 1 means incompressible; 10 means the payload shrinks tenfold. Being able to set
+/// the ratio is what lets a test prove the budget is applied to **compressed** bytes: the same
+/// commands, the same budget, a different ratio, and a different number of entries fit. A fake
+/// that always returned the input length could not distinguish that from a row count.
+#[derive(Debug, Clone)]
+pub struct FakeCompressor {
+    pub divisor: usize,
+    pub calls: Rc<Cell<usize>>,
+}
+
+impl FakeCompressor {
+    #[must_use]
+    pub fn with_ratio(divisor: usize) -> Self {
+        Self {
+            divisor: divisor.max(1),
+            calls: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl Default for FakeCompressor {
+    fn default() -> Self {
+        Self::with_ratio(1)
+    }
+}
+
+impl Compressor for FakeCompressor {
+    fn compressed_len(&self, bytes: &[u8]) -> usize {
+        self.calls.set(self.calls.get() + 1);
+        bytes.len().div_ceil(self.divisor)
     }
 }
 
@@ -345,17 +409,107 @@ pub fn batch_with_digest(changes: Vec<Change>, digest: HexString) -> Batch {
 }
 
 /// The engine used by every test here.
-pub type TestEngine = credsync_core::Engine<FakeClock, FakeEntropy, SharedStorage, FakeTransport>;
+pub type TestEngine =
+    credsync_core::Engine<FakeClock, FakeEntropy, SharedStorage, FakeTransport, FakeCompressor>;
 
 /// A fresh engine and the handle onto the storage it owns.
 #[must_use]
 pub fn new_engine() -> (TestEngine, SharedStorage) {
+    new_engine_with(FakeCompressor::with_ratio(1))
+}
+
+/// A fresh engine whose compressor reports a chosen ratio.
+#[must_use]
+pub fn new_engine_with(compressor: FakeCompressor) -> (TestEngine, SharedStorage) {
     let storage = SharedStorage::new();
     let engine = credsync_core::Engine::new(
         FakeClock::default(),
         FakeEntropy::default(),
         storage.clone(),
         FakeTransport::default(),
+        compressor,
     );
     (engine, storage)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Command builders
+// ---------------------------------------------------------------------------------------------
+
+/// A UUIDv7 with `n` folded into its tail, so tests can name commands readably.
+#[must_use]
+pub fn command_id(n: u8) -> CommandId {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0x01;
+    bytes[1] = 0x91;
+    bytes[6] = 0x70;
+    bytes[15] = n;
+    CommandId::from_bytes(bytes).expect("version nibble is 7")
+}
+
+/// A command whose payload is `filler_len` bytes of repeated text.
+///
+/// The filler is a single repeated character so it compresses predictably — which is what lets a
+/// test reason about compressed size rather than merely measure it.
+#[must_use]
+pub fn command(n: u8, filler_len: usize) -> Command {
+    Command {
+        id: command_id(n),
+        name: CommandName::new("submit_reflection").expect("valid name"),
+        scope: scope(),
+        payload: Payload::new(serde_json::json!({ "body": "x".repeat(filler_len) }))
+            .expect("valid payload"),
+        client_ts: 1_756_137_600_000,
+        checksum: hex("7b2e15c0a94d3f68e0517cab2d94f831"),
+    }
+}
+
+/// An outbox entry wrapping [`command`].
+#[must_use]
+pub fn entry(n: u8, filler_len: usize) -> OutboxEntry {
+    OutboxEntry::new(command(n, filler_len), schema())
+}
+
+#[must_use]
+pub fn protocol() -> ProtocolVersion {
+    ProtocolVersion::new(1).expect("valid protocol")
+}
+
+/// A push response answering `results`.
+#[must_use]
+pub fn push_response(results: Vec<CommandResult>) -> PushResponse {
+    PushResponse {
+        protocol: protocol(),
+        results,
+    }
+}
+
+#[must_use]
+pub fn applied(n: u8, server_seq: u64) -> CommandResult {
+    CommandResult {
+        id: command_id(n),
+        status: Status::Applied,
+        reason: None,
+        server_seq: Some(Seq::new(server_seq).expect("valid seq")),
+    }
+}
+
+#[must_use]
+pub fn rejected(n: u8, why: &str) -> CommandResult {
+    CommandResult {
+        id: command_id(n),
+        status: Status::Rejected,
+        reason: Some(Reason::new(why).expect("valid reason")),
+        server_seq: None,
+    }
+}
+
+#[must_use]
+pub fn superseded(n: u8) -> CommandResult {
+    CommandResult {
+        id: command_id(n),
+        status: Status::Superseded,
+        reason: None,
+        server_seq: None,
+    }
 }

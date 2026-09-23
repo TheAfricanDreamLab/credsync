@@ -24,8 +24,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use credsync_core::{
-    Clock, Engine, Entropy, RequestId, Storage, StorageError, StorageOp, Timestamp, Transport,
-    TransportError, TxOutcome, WireRequest,
+    Clock, Compressor, Engine, Entropy, RequestId, Storage, StorageError, StorageOp, Timestamp,
+    Transport, TransportError, TxOutcome, WireRequest,
 };
 use credsync_protocol::{EntityId, EntityName, RowVersion};
 use std::cell::{Cell, RefCell};
@@ -78,6 +78,16 @@ impl Storage for RcStorage {
     }
 }
 
+/// A compressor whose state cannot leave this thread either.
+struct RcCompressor(Rc<Cell<usize>>);
+
+impl Compressor for RcCompressor {
+    fn compressed_len(&self, bytes: &[u8]) -> usize {
+        self.0.set(self.0.get() + 1);
+        bytes.len()
+    }
+}
+
 /// Transport that records requests and mints handles.
 struct RcTransport {
     next_id: Rc<Cell<u64>>,
@@ -93,7 +103,7 @@ impl Transport for RcTransport {
     }
 }
 
-fn engine() -> Engine<RcClock, RcEntropy, RcStorage, RcTransport> {
+fn engine() -> Engine<RcClock, RcEntropy, RcStorage, RcTransport, RcCompressor> {
     Engine::new(
         RcClock(Rc::new(Cell::new(1_756_137_600_000))),
         RcEntropy(Rc::new(Cell::new(0))),
@@ -102,12 +112,13 @@ fn engine() -> Engine<RcClock, RcEntropy, RcStorage, RcTransport> {
             next_id: Rc::new(Cell::new(1)),
             sent: Rc::new(RefCell::new(Vec::new())),
         },
+        RcCompressor(Rc::new(Cell::new(0))),
     )
 }
 
 /// The load-bearing assertion: this compiles at all.
 ///
-/// All four implementations are `!Send` and `!Sync`. Adding `Send` anywhere in `Engine`'s bounds
+/// All five implementations are `!Send` and `!Sync`. Adding `Send` anywhere in `Engine`'s bounds
 /// breaks this line, which is the whole mechanism.
 #[test]
 fn engine_builds_from_parts_that_cannot_cross_threads() {
@@ -130,7 +141,7 @@ fn a_new_engine_queues_no_effects() {
 
 /// `Debug` works without the four implementations being `Debug` themselves.
 ///
-/// None of `RcClock`, `RcEntropy`, `RcStorage` or `RcTransport` derives `Debug`. A derived
+/// None of `RcClock`, `RcEntropy`, `RcStorage`, `RcTransport` or `RcCompressor` derives `Debug`. A derived
 /// `Debug` on `Engine` would have added those bounds and this would not compile — which would
 /// mean a caller could not debug-print an engine holding a SQLite handle.
 #[test]
@@ -142,12 +153,12 @@ fn engine_is_debug_without_its_parts_being_debug() {
     );
 }
 
-/// The four implementations work when driven directly.
+/// The five implementations work when driven directly.
 ///
 /// Nothing calls them through the engine yet — that is CS-7 — so this checks the trait
 /// signatures are actually usable rather than merely well-formed.
 #[test]
-fn the_four_implementations_are_usable() {
+fn the_five_implementations_are_usable() {
     let ticks = Rc::new(Cell::new(42));
     let clock = RcClock(Rc::clone(&ticks));
     assert_eq!(clock.now(), Timestamp::from_millis(42));
@@ -165,6 +176,11 @@ fn the_four_implementations_are_usable() {
     let mut storage = RcStorage(Rc::clone(&log));
     assert_eq!(storage.transact(&[]).unwrap(), TxOutcome::new(0));
     assert!(log.borrow().is_empty());
+
+    let calls = Rc::new(Cell::new(0));
+    let compressor = RcCompressor(Rc::clone(&calls));
+    assert_eq!(compressor.compressed_len(b"abcd"), 4);
+    assert_eq!(calls.get(), 1, "the compressor really was consulted");
 }
 
 /// Proves `assert_send` constrains anything at all.
