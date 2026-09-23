@@ -1,0 +1,554 @@
+//! The world: N devices and one server, driven forward through simulated time.
+//!
+//! Every device runs the **real** `credsync_core::Engine`. Nothing here reimplements the client;
+//! the simulator's job is to be reality, badly behaved, and to watch what the engine does about
+//! it.
+//!
+//! # Time compression
+//!
+//! The loop advances virtual time in steps of minutes, so a run of a few thousand steps covers
+//! weeks of device life in a fraction of a second of CPU. Nothing sleeps, nothing waits on a real
+//! clock, and no step costs more than the work inside it. That is the entire reason a thousand
+//! seeds is a routine thing to run rather than an overnight job.
+
+use crate::fakes::{
+    Db, SimClock, SimCompressor, SimEntropy, SimStorage, SimTransport, StorageVerdict,
+};
+use crate::fault::{
+    FLAP_DURATION_MS, Fault, FaultRates, SKEW_MAGNITUDE_MS, decide_response, decide_storage,
+};
+use crate::rng::Rng;
+use crate::server::Server;
+use crate::trace::Trace;
+use credsync_core::{Engine, OutboxEntry, ScopeState, WireRequest, WireResponse};
+use credsync_protocol::{
+    Command, CommandId, CommandName, ConflictClass, Cursor, EntityName, EntityRegistration,
+    HexString, Payload, PullRequest, SchemaVersion, ScopeCursor, ScopeDigest, ScopeId,
+};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// How long one step of simulated time lasts.
+const STEP_MS: i64 = 60_000;
+
+/// Changes per pull batch, so a device walks forward rather than catching up in one go.
+const PULL_LIMIT: usize = 4;
+
+/// The engine, with every trait bound to its simulated counterpart.
+type SimEngine = Engine<SimClock, SimEntropy, SimStorage, SimTransport, SimCompressor>;
+
+/// A response in flight, waiting for its delivery time.
+struct InFlight {
+    device: usize,
+    deliver_at_ms: i64,
+    response: Result<WireResponse, credsync_core::TransportError>,
+}
+
+/// One simulated device.
+struct Device {
+    engine: SimEngine,
+    clock: SimClock,
+    storage: SimStorage,
+    transport: SimTransport,
+    /// True time at which connectivity returns, when flapped.
+    offline_until_ms: i64,
+    /// Requests this device has enqueued, for the periodic drop.
+    requests_sent: u64,
+    /// Commands this device has authored, so ids stay unique and deterministic.
+    commands_authored: u8,
+}
+
+/// The whole simulation.
+pub struct World {
+    devices: Vec<Device>,
+    server: Server,
+    rng: Rng,
+    rates: FaultRates,
+    now_ms: i64,
+    in_flight: Vec<InFlight>,
+    /// Responses held back by a reorder fault, released after the next one.
+    held: Vec<InFlight>,
+    scope: ScopeId,
+    entity: EntityName,
+    /// What the run recorded.
+    pub trace: Trace,
+}
+
+impl World {
+    /// Builds a world from a seed.
+    ///
+    /// Everything that varies between runs — device count, clock skew, drift, compression ratio —
+    /// is drawn here from the seeded generator, so the seed alone determines the whole shape of
+    /// the run and not merely its faults.
+    #[must_use]
+    pub fn new(seed: u64, rates: FaultRates, trace: Trace) -> Self {
+        let mut rng = Rng::new(seed);
+        let scope = ScopeId::new("inst:adl:enr:2026-cohort")
+            .unwrap_or_else(|_| unreachable!("literal is a valid scope"));
+        let entity = EntityName::new("reflections")
+            .unwrap_or_else(|_| unreachable!("literal is a valid entity"));
+
+        let device_count = rng.range(2, 4) as usize;
+        let now_ms = 1_756_137_600_000;
+
+        let mut server = Server::new();
+        server.register_command("submit_reflection", entity.clone(), scope.clone());
+
+        let devices = (0..device_count)
+            .map(|_| {
+                // Each device gets its own skew and drift: docs/spec.md §6 is explicit that
+                // device clocks lie, so none of them agree with the world or each other.
+                let skew = rng.signed(SKEW_MAGNITUDE_MS);
+                let drift = i64::from(rng.range(0, 400)) - 200;
+                let clock = SimClock::new(now_ms, skew, drift);
+                let storage = SimStorage::new();
+                let transport = SimTransport::new();
+                let entropy = SimEntropy::new(rng.next_u64());
+                let compressor = SimCompressor::with_ratio(rng.range(1, 8) as usize);
+
+                let mut engine = Engine::new(
+                    clock.clone(),
+                    entropy,
+                    storage.clone(),
+                    transport.clone(),
+                    compressor,
+                );
+                register(engine.registry_mut(), &entity, &scope);
+
+                Device {
+                    engine,
+                    clock,
+                    storage,
+                    transport,
+                    offline_until_ms: 0,
+                    requests_sent: 0,
+                    commands_authored: 0,
+                }
+            })
+            .collect();
+
+        Self {
+            devices,
+            server,
+            rng,
+            rates,
+            now_ms,
+            in_flight: Vec::new(),
+            held: Vec::new(),
+            scope,
+            entity,
+            trace,
+        }
+    }
+
+    /// How many devices this run has.
+    #[must_use]
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Simulated milliseconds elapsed.
+    #[must_use]
+    pub const fn elapsed_ms(&self) -> i64 {
+        self.now_ms - 1_756_137_600_000
+    }
+
+    /// Runs `steps` of simulated time.
+    pub fn run(&mut self, steps: u32) {
+        for _ in 0..steps {
+            self.step();
+        }
+    }
+
+    /// One step: advance time, let each device act, carry the network, deliver what is due.
+    fn step(&mut self) {
+        self.now_ms += STEP_MS;
+
+        for d in &self.devices {
+            d.clock.advance_to(self.now_ms);
+        }
+
+        if self.rng.chance(self.rates.server_restart) {
+            self.server.restart_cold();
+            self.trace.fault(self.now_ms, 0, Fault::ServerRestarted);
+        }
+
+        // Somebody else is always writing: another student, a teacher grading. Without this a
+        // device would only ever see changes it caused.
+        if self.rng.chance(2) {
+            let (scope, entity) = (self.scope.clone(), self.entity.clone());
+            self.server.external_change(&scope, &entity, &mut self.rng);
+        }
+
+        for i in 0..self.devices.len() {
+            self.device_step(i);
+        }
+
+        self.carry_network();
+        self.deliver_due();
+    }
+
+    /// One device's turn.
+    fn device_step(&mut self, i: usize) {
+        // Connectivity comes back when its flap expires.
+        if self.devices[i].offline_until_ms > 0 && self.now_ms >= self.devices[i].offline_until_ms {
+            self.devices[i].offline_until_ms = 0;
+            *self.devices[i].transport.online.borrow_mut() = true;
+        } else if self.devices[i].offline_until_ms == 0
+            && self.rng.chance(self.rates.connectivity_flap)
+        {
+            self.devices[i].offline_until_ms = self.now_ms + FLAP_DURATION_MS;
+            *self.devices[i].transport.online.borrow_mut() = false;
+            self.trace.fault(self.now_ms, i, Fault::Flap);
+        }
+
+        if self.rng.chance(self.rates.device_restart) {
+            self.restart_device(i);
+        }
+
+        // The user writes something. One percent per simulated minute is roughly a dozen
+        // reflections a day, which is an active student rather than a load generator.
+        if self.rng.chance(1) {
+            self.author_command(i);
+        }
+
+        // docs/spec.md §4: push precedes pull in every cycle, so a client immediately observes
+        // the server's transformation of its own writes.
+        self.push_step(i);
+        self.pull_step(i);
+    }
+
+    /// Queues a command, with a storage fault decided first.
+    fn author_command(&mut self, i: usize) {
+        let n = self.devices[i].commands_authored;
+        self.devices[i].commands_authored = n.wrapping_add(1);
+
+        let id = command_id(i as u8, n);
+        let command = Command {
+            id,
+            name: CommandName::new("submit_reflection")
+                .unwrap_or_else(|_| unreachable!("literal is a valid name")),
+            scope: self.scope.clone(),
+            payload: Payload::new(serde_json::json!({ "body": "x".repeat(32) }))
+                .unwrap_or_else(|_| unreachable!("literal is a valid payload")),
+            // The device's own clock, which is skewed. docs/spec.md §6: advisory only, and
+            // nothing may decide a conflict on it.
+            client_ts: credsync_core::Clock::now(&self.devices[i].clock).as_millis(),
+            checksum: hex_placeholder(),
+        };
+
+        self.arm_storage(i);
+        let schema =
+            SchemaVersion::new(1).unwrap_or_else(|_| unreachable!("1 is a valid schema version"));
+        match self.devices[i]
+            .engine
+            .enqueue(OutboxEntry::new(command, schema))
+        {
+            Ok(()) => self.trace.event(self.now_ms, i, "enqueued"),
+            Err(_) => self.trace.event(self.now_ms, i, "enqueue-refused"),
+        }
+    }
+
+    /// Decides whether this device's next storage transaction misbehaves.
+    fn arm_storage(&mut self, i: usize) {
+        let verdict = match decide_storage(&mut self.rng, &self.rates) {
+            Some(Fault::StorageFailed) => {
+                self.trace.fault(self.now_ms, i, Fault::StorageFailed);
+                StorageVerdict::FailBeforeCommit
+            }
+            Some(Fault::StorageCommittedThenKilled) => {
+                self.trace
+                    .fault(self.now_ms, i, Fault::StorageCommittedThenKilled);
+                StorageVerdict::CommitThenLoseAck
+            }
+            _ => StorageVerdict::Commit,
+        };
+        self.devices[i].storage.0.borrow_mut().verdict = verdict;
+    }
+
+    /// Builds and sends a push, if there is anything queued.
+    fn push_step(&mut self, i: usize) {
+        let Ok(Some(request)) = self.devices[i]
+            .engine
+            .build_push(Server::protocol(), 100_000)
+        else {
+            return;
+        };
+        if request.commands.is_empty() {
+            return;
+        }
+        let mut transport = self.devices[i].transport.clone();
+        let _ = credsync_core::Transport::enqueue(&mut transport, WireRequest::Push(request));
+    }
+
+    /// Sends a pull for this device's scope.
+    fn pull_step(&mut self, i: usize) {
+        let cursor = self.devices[i]
+            .engine
+            .scope_state(&self.scope)
+            .map_or(Cursor::START, |s| s.cursor);
+
+        let request = PullRequest {
+            protocol: Server::protocol(),
+            scopes: vec![ScopeCursor {
+                scope: self.scope.clone(),
+                cursor,
+            }],
+            limit_bytes: None,
+        };
+        let mut transport = self.devices[i].transport.clone();
+        let _ = credsync_core::Transport::enqueue(&mut transport, WireRequest::Pull(request));
+    }
+
+    /// Takes everything the devices enqueued, answers it, and applies faults.
+    fn carry_network(&mut self) {
+        for i in 0..self.devices.len() {
+            for out in self.devices[i].transport.drain() {
+                self.devices[i].requests_sent += 1;
+                let index = self.devices[i].requests_sent;
+
+                let fault = decide_response(&mut self.rng, &self.rates, index);
+                if let Some(f) = fault {
+                    self.trace.fault(self.now_ms, i, f);
+                }
+                if matches!(fault, Some(Fault::Dropped)) {
+                    continue;
+                }
+
+                let response = match &out.request {
+                    WireRequest::Pull(req) => {
+                        Ok(WireResponse::Pull(self.server.pull(req, PULL_LIMIT)))
+                    }
+                    WireRequest::Push(req) => {
+                        Ok(WireResponse::Push(self.server.push(req, &mut self.rng)))
+                    }
+                    WireRequest::Bootstrap(_) => continue,
+                    _ => continue,
+                };
+
+                // Severed and malformed both arrive as a transport-level failure, because that is
+                // what the client sees: bytes that did not decode. The distinction matters to the
+                // trace, not to the engine.
+                let response = match fault {
+                    Some(Fault::Severed) => Err(credsync_core::TransportError::Malformed {
+                        detail: "severed mid-batch".to_owned(),
+                    }),
+                    Some(Fault::Malformed) => Err(credsync_core::TransportError::Malformed {
+                        detail: "corrupted bytes".to_owned(),
+                    }),
+                    _ => response,
+                };
+
+                let latency = i64::from(
+                    self.rng
+                        .range(self.rates.latency_ms.0, self.rates.latency_ms.1),
+                );
+                let flight = InFlight {
+                    device: i,
+                    deliver_at_ms: self.now_ms + latency,
+                    response,
+                };
+
+                match fault {
+                    Some(Fault::Duplicated) => {
+                        // The same answer twice, at different times.
+                        self.in_flight.push(InFlight {
+                            device: i,
+                            deliver_at_ms: flight.deliver_at_ms + i64::from(self.rng.range(1, 500)),
+                            response: clone_response(&flight.response),
+                        });
+                        self.in_flight.push(flight);
+                    }
+                    Some(Fault::Reordered) => self.held.push(flight),
+                    _ => self.in_flight.push(flight),
+                }
+            }
+        }
+
+        // Held responses rejoin the queue behind whatever overtook them.
+        for mut h in std::mem::take(&mut self.held) {
+            h.deliver_at_ms = self.now_ms + STEP_MS + i64::from(self.rng.range(1, 900));
+            self.in_flight.push(h);
+        }
+    }
+
+    /// Hands every response whose time has come to the device that asked for it.
+    fn deliver_due(&mut self) {
+        // Partitioned rather than sorted: delivery order among simultaneous responses is the
+        // order they were queued, which is deterministic, and sorting would need a tiebreak that
+        // is one more thing to get wrong.
+        let due: Vec<InFlight> = {
+            let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.in_flight)
+                .into_iter()
+                .partition(|f| f.deliver_at_ms <= self.now_ms);
+            self.in_flight = waiting;
+            ready
+        };
+
+        for f in due {
+            let i = f.device;
+            match f.response {
+                Err(_) => self.trace.event(self.now_ms, i, "response-failed"),
+                Ok(WireResponse::Pull(response)) => {
+                    for batch in &response.batches {
+                        self.arm_storage(i);
+                        match self.devices[i].engine.apply_batch(batch) {
+                            Ok(applied) => {
+                                self.trace.event(
+                                    self.now_ms,
+                                    i,
+                                    if applied.diverged {
+                                        "applied-diverged"
+                                    } else {
+                                        "applied"
+                                    },
+                                );
+                            }
+                            Err(_) => self.trace.event(self.now_ms, i, "apply-refused"),
+                        }
+                    }
+                }
+                Ok(WireResponse::Push(response)) => {
+                    self.arm_storage(i);
+                    match self.devices[i].engine.apply_results(&response) {
+                        Ok(r) => {
+                            let _ = r;
+                            self.trace.event(self.now_ms, i, "results-applied");
+                        }
+                        Err(_) => self.trace.event(self.now_ms, i, "results-refused"),
+                    }
+                }
+                Ok(_) => self.trace.event(self.now_ms, i, "response-ignored"),
+            }
+        }
+    }
+
+    /// Restarts a device: a fresh engine, reloading everything from storage.
+    ///
+    /// This is what makes the kill-between-commit-and-ack fault mean anything. The engine's
+    /// in-memory state is discarded; whatever the database holds is the truth, and the outbox is
+    /// replayed against a server that dedupes.
+    fn restart_device(&mut self, i: usize) {
+        self.trace.fault(self.now_ms, i, Fault::DeviceRestarted);
+
+        let storage = self.devices[i].storage.clone();
+        let clock = self.devices[i].clock.clone();
+        let transport = SimTransport::new();
+        let entropy = SimEntropy::new(self.rng.next_u64());
+        let compressor = SimCompressor::default();
+
+        let mut engine = Engine::new(
+            clock.clone(),
+            entropy,
+            storage.clone(),
+            transport.clone(),
+            compressor,
+        );
+        register(engine.registry_mut(), &self.entity, &self.scope);
+
+        // Restore from what the database holds, which is the whole point of the restart.
+        let db = storage.0.borrow();
+        if let Some(cursor) = db.cursors.get(&self.scope) {
+            let digest = db
+                .digests
+                .get(&self.scope)
+                .and_then(digest_from_hex)
+                .unwrap_or(ScopeDigest::EMPTY);
+            engine.restore_scope(self.scope.clone(), ScopeState::restored(*cursor, digest));
+        }
+        engine.restore_outbox(
+            db.outbox
+                .iter()
+                .map(|(c, s)| OutboxEntry::new(c.clone(), *s)),
+        );
+        drop(db);
+
+        self.devices[i].engine = engine;
+        self.devices[i].transport = transport;
+        self.devices[i].clock = clock;
+    }
+
+    /// Every device's database, for the invariants at CS-12 to read.
+    #[must_use]
+    pub fn databases(&self) -> Vec<Rc<RefCell<Db>>> {
+        self.devices.iter().map(|d| d.storage.0.clone()).collect()
+    }
+
+    /// The server, for the invariants at CS-12 to compare against.
+    #[must_use]
+    pub const fn server(&self) -> &Server {
+        &self.server
+    }
+
+    /// What each device currently believes the time is, and what it actually is.
+    ///
+    /// Exposed so a test can check the clocks really do disagree. `docs/spec.md` §6 rests on
+    /// device clocks lying, and a simulator whose clocks all told the truth would let a
+    /// `client_ts`-dependent bug pass every run it ever did.
+    #[must_use]
+    pub fn apparent_times_ms(&self) -> (i64, Vec<i64>) {
+        (
+            self.now_ms,
+            self.devices
+                .iter()
+                .map(|d| credsync_core::Clock::now(&d.clock).as_millis())
+                .collect(),
+        )
+    }
+
+    /// The scope every device in this run subscribes to.
+    #[must_use]
+    pub const fn scope(&self) -> &ScopeId {
+        &self.scope
+    }
+}
+
+/// Declares the entity and command every device in a run uses.
+fn register(registry: &mut credsync_core::Registry, entity: &EntityName, scope: &ScopeId) {
+    registry.register_entity(EntityRegistration {
+        entity: entity.clone(),
+        scope: scope.clone(),
+        conflict_class: ConflictClass::OwnerDraft,
+        schema_version: SchemaVersion::new(1)
+            .unwrap_or_else(|_| unreachable!("1 is a valid schema version")),
+    });
+    registry.register_command(
+        CommandName::new("submit_reflection")
+            .unwrap_or_else(|_| unreachable!("literal is a valid name")),
+        entity.clone(),
+    );
+}
+
+/// A UUIDv7 built from a device index and a counter, so ids are unique and reproducible.
+fn command_id(device: u8, n: u8) -> CommandId {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0x01;
+    bytes[1] = 0x91;
+    bytes[6] = 0x70;
+    bytes[14] = device;
+    bytes[15] = n;
+    CommandId::from_bytes(bytes).unwrap_or_else(|_| unreachable!("version nibble is 7"))
+}
+
+fn hex_placeholder() -> HexString {
+    HexString::new("00000000000000000000000000000000")
+        .unwrap_or_else(|_| unreachable!("32 zeros is valid hex"))
+}
+
+/// Rebuilds a digest from its wire form, for restoring a scope after a restart.
+fn digest_from_hex(hex: &HexString) -> Option<ScopeDigest> {
+    u128::from_str_radix(hex.as_str(), 16)
+        .ok()
+        .map(ScopeDigest::from_raw)
+}
+
+/// Responses are cloned for the duplicate fault; errors do not implement `Clone` uniformly, so
+/// this rebuilds the shape rather than deriving it.
+fn clone_response(
+    r: &Result<WireResponse, credsync_core::TransportError>,
+) -> Result<WireResponse, credsync_core::TransportError> {
+    match r {
+        Ok(v) => Ok(v.clone()),
+        Err(e) => Err(e.clone()),
+    }
+}

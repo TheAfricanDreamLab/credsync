@@ -15,6 +15,35 @@
 //!
 //! # Status
 //!
-//! Scaffolded at CS-1. Fault scheduler arrives at CS-11, invariants at CS-12.
+//! Scaffolded at CS-1, fault scheduler and seed replay at CS-11. Invariants arrive at CS-12 and
+//! the planted-bug drill at CS-13 — until those land, a run proves the harness runs, not that the
+//! engine is correct.
 
 #![forbid(unsafe_code)]
+
+pub mod fakes;
+pub mod fault;
+pub mod rng;
+pub mod server;
+pub mod trace;
+pub mod world;
+
+pub use fault::{Fault, FaultRates};
+pub use rng::Rng;
+pub use server::Server;
+pub use trace::Trace;
+pub use world::World;
+
+/// How many steps of simulated time one run covers.
+///
+/// At one minute per step this is a fortnight of device life, which is the scale `docs/spec.md`
+/// keeps describing: *"a three-week-offline device simply walks forward"*. It costs milliseconds.
+pub const STEPS_PER_RUN: u32 = 20_160;
+
+/// Runs one seed and returns its trace.
+#[must_use]
+pub fn run_seed(seed: u64, rates: FaultRates, trace: Trace) -> World {
+    let mut world = World::new(seed, rates, trace);
+    world.run(STEPS_PER_RUN);
+    world
+}
