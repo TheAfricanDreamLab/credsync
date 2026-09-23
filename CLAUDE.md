@@ -119,8 +119,34 @@ cargo deny check licenses
 From CS-6 onward, also:
 
 ```sh
-cargo miri test -p credsync-core -p credsync-protocol
+./scripts/check-sans-io.sh                                    # greps the core's SOURCE
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p credsync-core -p credsync-protocol
 ```
+
+**Two things about that Miri line, both learned the hard way at CS-6.**
+
+`-Zmiri-disable-isolation` is required and is *not* a weakened gate. `proptest` calls
+`std::env::current_dir()` to locate its failure-persistence file; Miri's sandbox refuses
+`getcwd`, and the run aborts with `unsupported operation` before testing anything. The flag
+relaxes Miri's *sandbox*, not its undefined-behaviour checking, which is the part that matters.
+Without it the gate does not run at all — and a gate that aborts looks a lot like a gate that
+passed.
+
+Miri needs a nightly toolchain, which `rust-toolchain.toml` deliberately does not pin. Install it
+with **`--profile minimal`**:
+
+```sh
+rustup toolchain install nightly --profile minimal --component miri
+```
+
+`--profile default` repeatedly produced a toolchain that rustup reported as installed while
+`bin/` held no `cargo` and no `miri` — the symptom is `error: the 'cargo' binary … is not
+applicable to the 'nightly' toolchain`, or a `dyld` failure naming `librustc_driver`. Both read
+like a broken Miri and are actually a truncated download. `rustup toolchain uninstall nightly`
+and reinstall with the minimal profile.
+
+Miri is slow. Cap the property tests while iterating — `PROPTEST_CASES=8` — and let CI run the
+full count.
 
 From CS-11 onward, also:
 

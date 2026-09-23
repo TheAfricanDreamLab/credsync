@@ -13,37 +13,57 @@ possible — and DST is how this project earns the right to claim it never loses
 
 ## The shape
 
-```rust
-// Events go in.
-engine.handle(Event::TransportResponse { id, bytes });
-engine.handle(Event::Tick { now });
+The engine **owns all four implementations** and calls them directly (D-037, settled at CS-6).
 
-// Effects come out. The caller performs them.
+```rust
+let mut engine = Engine::new(clock, entropy, storage, transport);
+
+// Events go in.
+engine.handle(Event::Tick { now });
+engine.handle(Event::TransportResponse { id, result });
+
+// Effects come out — only what the four traits cannot express.
 while let Some(effect) = engine.next_effect() {
     match effect {
-        Effect::Send(req)          => transport.enqueue(req),
-        Effect::Persist(ops)       => storage.transact(&ops)?,
-        Effect::ScheduleRetry(at)  => timer.set(at),
-        Effect::Emit(telemetry)    => host.emit(telemetry),
+        Effect::ScheduleRetry { at } => timer.set(at),
+        Effect::Emit(telemetry)      => host.emit(telemetry),
+        _ => {}                       // Effect is #[non_exhaustive] for callers
     }
 }
 ```
 
-The engine decides *what* must happen. The caller decides *how*. In production the caller is the
-FFI layer with real implementations; in the simulator it is seeded fakes. **The same core bytes
-run in both worlds** — that is the entire trick.
+**There is no `Effect::Send` or `Effect::Persist`** — an earlier draft of this skill showed
+those, and it was wrong. Where the boundary falls depends on whether a trait answers immediately:
+
+| Trait | Called by | Result arrives as | Why |
+|---|---|---|---|
+| `Clock` | engine | return value | Immediate. |
+| `Entropy` | engine | return value | Immediate. |
+| `Storage` | engine | return value | `transact` is synchronous. Routing its outcome back through the event queue would park a half-finished apply across a round trip — and `spec.md` §4 needs rows and cursor to commit together. |
+| `Transport` | engine | `Event::TransportResponse` | A request handed to a network that routinely does not answer cannot be awaited. |
+
+The engine decides *what* must happen and, for everything with an immediate answer, does it. In
+production the four are real implementations; in the simulator they are seeded fakes. **The same
+core bytes run in both worlds** — that is the entire trick.
 
 ## The four traits
 
 ```rust
 trait Clock     { fn now(&self) -> Timestamp; }
 trait Entropy   { fn fill(&mut self, buf: &mut [u8]); }   // UUIDv7, jitter
-trait Storage   { fn transact(&mut self, ops: &[StorageOp]) -> Result<TxOutcome>; }
-trait Transport { fn enqueue(&mut self, req: WireRequest) -> RequestId; }
+trait Storage   { fn transact(&mut self, ops: &[StorageOp]) -> Result<TxOutcome, StorageError>; }
+trait Transport { fn enqueue(&mut self, req: WireRequest) -> Result<RequestId, TransportError>; }
 ```
 
-They are **parameters of the core, never dependencies of it**. Time enters as `Event::Tick`,
-randomness as bytes from `Entropy`, never as an ambient call.
+They are **parameters of the core, never dependencies of it** — declared in `credsync-core`,
+implemented only outside it. Time enters as `Event::Tick`, randomness as bytes from `Entropy`,
+never as an ambient call.
+
+**None of them may gain a `Send` or `Sync` bound.** One engine, one thread. Hermes is
+single-threaded and `rusqlite::Connection` is not `Sync`, so a `Send` bound would push every
+binding into wrapping its database handle in a mutex to satisfy a constraint the design never
+had. `credsync-core/tests/single_threaded.rs` builds an engine from four `!Send` parts, so adding
+such a bound stops compiling.
 
 ## Ban list
 
@@ -68,9 +88,22 @@ though nothing obviously "does I/O". If order can affect output, use an ordered 
 Verify with:
 
 ```sh
+./scripts/check-sans-io.sh         # greps the SOURCE of core and protocol
 cargo tree -p credsync-core        # no tokio, no reqwest, no rusqlite
 cargo test -p credsync-core        # runs without a runtime
 ```
+
+The first two are complements, not duplicates, and the distinction matters (D-038). `cargo tree`
+watches what the crate *depends on*; it cannot see `SystemTime::now()`, which needs no dependency,
+touches no manifest, compiles cleanly, and leaves every test green while deterministic replay is
+silently gone. `check-sans-io.sh` watches what the crate *writes*.
+
+It strips comment-only lines before matching, so the prose explaining a ban does not trip the
+gate — but a trailing comment on a line of code is **not** stripped. Put `// see Instant::now` on
+its own line.
+
+When you add a row to the ban list above, add the pattern to `scripts/check-sans-io.sh` too. A
+ban list that only exists in a document is a suggestion.
 
 ## Adding a state transition
 
