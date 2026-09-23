@@ -32,7 +32,16 @@ fails, stop and fix it before anything else — every other sim result has becom
 
 ## Adding a fault
 
-1. Add the variant to the fault menu.
+The menu lives in `credsync-sim/src/fault.rs`; the world that applies it is `world.rs`.
+
+**Every branch of a fault decision must draw the same number of times from the generator**, used
+or not. A decision whose cost depended on its outcome would shift every later decision, so two
+runs differing in one early coin flip would diverge wildly instead of comparably — determinism
+preserved, reproducibility made useless for narrowing anything down. `decide_response` draws all
+four chances up front and then chooses; keep that shape.
+
+1. Add the variant to the fault menu, and to `Fault::ALL` — the coverage report iterates that
+   list, so a variant missing from it is invisible.
 2. Drive it from the seeded RNG — never from a real source of chance.
 3. Give it a tunable probability; register it in the distribution table.
 4. Run a 1,000-seed batch and confirm the fault **actually occurs** (see coverage below).
@@ -62,12 +71,25 @@ The standing set:
 invariant catch it, then revert. An invariant that has never fired is untested — it may be
 asserting something trivially true, or nothing at all.
 
+## Running it
+
+```sh
+cargo run --release -p credsync-sim -- --seeds 1000    # the batch
+cargo run --release -p credsync-sim -- --seed 0x4f21a9c3 --trace
+```
+
+**Use `--release`.** A debug build is roughly forty times slower, which turns a 22-minute batch
+into most of a day and quietly turns the batch into something nobody runs.
+
+Measured at CS-11 on a 2019 x86 laptop: one seed is ~1 second and covers a fortnight of device
+life across 2–4 devices. A 1,000-seed batch takes ~22 minutes and simulates about 38 years.
+
 ## Seed replay
 
 CI prints the seed on failure. To reproduce:
 
 ```sh
-cargo run -p credsync-sim -- --seed 0x4f21a9c3 --trace
+cargo run --release -p credsync-sim -- --seed 0x4f21a9c3 --trace
 ```
 
 Same seed, same trace, always. If a printed seed does not reproduce, **that is a more serious bug

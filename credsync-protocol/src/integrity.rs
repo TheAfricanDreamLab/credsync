@@ -187,4 +187,18 @@ impl ScopeDigest {
     pub const fn raw(self) -> u128 {
         self.0
     }
+
+    /// Rebuilds a digest from a previously stored accumulator.
+    ///
+    /// A client persists its digest per scope (Design §4.3) and must restore it at startup, or
+    /// every launch would look like divergence until the scope was walked from the beginning.
+    /// The inverse of [`raw`](Self::raw).
+    ///
+    /// No validation, because there is nothing to validate: every `u128` is a reachable digest
+    /// value. A wrong one is caught the moment it disagrees with the server's, which is the
+    /// mechanism that exists for exactly this.
+    #[must_use]
+    pub const fn from_raw(v: u128) -> Self {
+        Self(v)
+    }
 }
