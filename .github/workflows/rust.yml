@@ -78,6 +78,13 @@ jobs:
           done
           exit $fail
 
+      # The graph check above cannot see `SystemTime::now()`, which needs no dependency at all.
+      # One line, no Cargo.toml change, every test still green - and deterministic replay is gone.
+      # The two checks are complements: one watches what the crate depends on, the other watches
+      # what it writes. Added at CS-6 (#7).
+      - name: No ambient world in the core's source
+        run: ./scripts/check-sans-io.sh
+
   deny:
     name: licences and advisories
     runs-on: ubuntu-latest

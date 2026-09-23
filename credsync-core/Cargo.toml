@@ -13,3 +13,11 @@ homepage.workspace     = true
 workspace = true
 
 [dependencies]
+# The protocol crate owns the wire; this crate owns *when* to put something on it. Depending on
+# it rather than redefining the request and response shapes keeps docs/spec.md law over exactly
+# one definition of each.
+#
+# Nothing else may be added here without checking it against the sans-IO ban list. The CI job
+# `core is sans-IO` greps this crate's whole dependency graph, so a transitive I/O crate fails
+# the build rather than arriving quietly.
+credsync-protocol = { path = "../credsync-protocol", version = "0.0.1" }

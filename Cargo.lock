@@ -82,6 +82,9 @@ dependencies = [
 [[package]]
 name = "credsync-core"
 version = "0.0.1"
+dependencies = [
+ "credsync-protocol",
+]
 
 [[package]]
 name = "credsync-ffi"
