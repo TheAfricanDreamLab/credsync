@@ -101,6 +101,31 @@ pub trait Storage {
     ) -> Result<Option<RowVersion>, StorageError>;
 }
 
+/// Measures how large a payload will be once compressed.
+///
+/// Added at CS-8 (D-042). `docs/spec.md` §2 makes byte budgets **compressed-size budgets**, and
+/// negotiates Brotli or gzip on the wire — so the core cannot know which algorithm will be used
+/// and must not guess. A batch sized against the wrong assumption either wastes a round trip on
+/// an under-filled request or gets refused for being over budget, and on a 2G link both are
+/// expensive.
+///
+/// The caller supplies the compressor its transport actually uses, so the number the engine
+/// budgets against is the number that goes on the wire. The simulator supplies a deterministic
+/// fake, exactly as for the other four traits.
+///
+/// Implementations must be **pure and deterministic**: the same bytes always yield the same
+/// length. A compressor consulting a clock, a thread pool, or an adaptive dictionary that varies
+/// between calls would make batch composition differ between two runs of the same seed, and
+/// deterministic replay would be gone.
+pub trait Compressor {
+    /// The length `bytes` would occupy compressed.
+    ///
+    /// Implementations may compress for real or estimate, but an estimate that under-reports
+    /// produces over-budget requests. When in doubt, over-report: a slightly under-filled batch
+    /// costs one extra round trip, while a refused one costs that plus a retry.
+    fn compressed_len(&self, bytes: &[u8]) -> usize;
+}
+
 /// Hands a request to the network.
 ///
 /// Fire-and-forget by design: `enqueue` returns a handle immediately and the answer arrives later
