@@ -54,11 +54,13 @@
 #![forbid(unsafe_code)]
 
 pub mod apply;
+pub mod conflict;
 pub mod effect;
 pub mod engine;
 pub mod error;
 pub mod event;
 pub mod outbox;
+pub mod registry;
 pub mod scope;
 pub mod storage;
 pub mod traits;
@@ -66,11 +68,13 @@ pub mod types;
 pub mod wire;
 
 pub use apply::{Applied, ApplyError};
+pub use conflict::{Lww, lww_winner};
 pub use effect::{Effect, Telemetry};
 pub use engine::Engine;
 pub use error::{StorageError, TransportError};
 pub use event::Event;
 pub use outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
+pub use registry::{Registry, RegistryError};
 pub use scope::ScopeState;
 pub use storage::{StorageOp, TxOutcome};
 pub use traits::{Clock, Compressor, Entropy, Storage, Transport};

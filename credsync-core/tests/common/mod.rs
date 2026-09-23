@@ -13,9 +13,9 @@ use credsync_core::{
 };
 use credsync_core::{RequestId, Storage, StorageError, StorageOp, Timestamp, TxOutcome};
 use credsync_protocol::{
-    Batch, Change, Command, CommandId, CommandName, CommandResult, Cursor, EntityId, EntityName,
-    HexString, Op, Payload, ProtocolVersion, PushResponse, Reason, RowVersion, SchemaVersion,
-    ScopeDigest, ScopeId, Seq, Snapshot, Status,
+    Batch, Change, Command, CommandId, CommandName, CommandResult, ConflictClass, Cursor, EntityId,
+    EntityName, EntityRegistration, HexString, Op, Payload, ProtocolVersion, PushResponse, Reason,
+    RowVersion, SchemaVersion, ScopeDigest, ScopeId, Seq, Snapshot, Status,
 };
 use serde_json::json;
 use std::cell::{Cell, RefCell};
@@ -52,6 +52,8 @@ pub struct FakeStorage {
     pub queued: Vec<(CommandId, SchemaVersion)>,
     /// Recorded outcomes, in resolution order.
     pub resolved: Vec<(CommandId, credsync_core::Resolution)>,
+    /// Recovered drafts: the command whose edit lost, its entity, and the content preserved.
+    pub recovered: Vec<(CommandId, EntityName, Payload)>,
 }
 
 impl FakeStorage {
@@ -111,6 +113,7 @@ impl FakeStorage {
             digests: self.digests.clone(),
             queued: self.queued.clone(),
             resolved: self.resolved.clone(),
+            recovered: self.recovered.clone(),
         };
 
         for op in ops {
@@ -150,6 +153,14 @@ impl FakeStorage {
                     s.queued.retain(|(qid, _)| qid != id);
                     s.resolved.push((*id, resolution.clone()));
                 }
+                StorageOp::SaveRecoveredDraft {
+                    entity,
+                    command_id,
+                    payload,
+                } => {
+                    s.recovered
+                        .push((*command_id, entity.clone(), payload.clone()));
+                }
                 _ => {}
             }
         }
@@ -166,6 +177,7 @@ pub struct Snapshotted {
     digests: BTreeMap<ScopeId, HexString>,
     queued: Vec<(CommandId, SchemaVersion)>,
     resolved: Vec<(CommandId, credsync_core::Resolution)>,
+    recovered: Vec<(CommandId, EntityName, Payload)>,
 }
 
 impl Storage for FakeStorage {
@@ -186,6 +198,7 @@ impl Storage for FakeStorage {
         self.digests = staged.digests;
         self.queued = staged.queued;
         self.resolved = staged.resolved;
+        self.recovered = staged.recovered;
         self.commits += 1;
         Ok(TxOutcome::new(ops.len()))
     }
@@ -368,6 +381,15 @@ pub fn upsert(seq: u64, entity_id: &str, row_version: u64) -> Change {
     }
 }
 
+/// An upsert against a named entity, for conflict-class tests.
+#[must_use]
+pub fn upsert_of(entity: &str, seq: u64, entity_id: &str, row_version: u64) -> Change {
+    Change {
+        entity: EntityName::new(entity).expect("valid entity"),
+        ..upsert(seq, entity_id, row_version)
+    }
+}
+
 /// A tombstone for `entity_id` at `seq`.
 #[must_use]
 pub fn tombstone(seq: u64, entity_id: &str, row_version: u64) -> Change {
@@ -419,17 +441,74 @@ pub fn new_engine() -> (TestEngine, SharedStorage) {
 }
 
 /// A fresh engine whose compressor reports a chosen ratio.
+///
+/// Comes with the default registry from [`register_defaults`], because an engine with an empty
+/// registry accepts no commands at all — which is correct, and would make every outbox test a
+/// test of the registry instead.
 #[must_use]
 pub fn new_engine_with(compressor: FakeCompressor) -> (TestEngine, SharedStorage) {
     let storage = SharedStorage::new();
-    let engine = credsync_core::Engine::new(
+    let mut engine = credsync_core::Engine::new(
         FakeClock::default(),
         FakeEntropy::default(),
         storage.clone(),
         FakeTransport::default(),
         compressor,
     );
+    register_defaults(engine.registry_mut());
     (engine, storage)
+}
+
+/// An engine with a deliberately empty registry.
+#[must_use]
+pub fn new_engine_unregistered() -> (TestEngine, SharedStorage) {
+    let storage = SharedStorage::new();
+    let engine = credsync_core::Engine::new(
+        FakeClock::default(),
+        FakeEntropy::default(),
+        storage.clone(),
+        FakeTransport::default(),
+        FakeCompressor::with_ratio(1),
+    );
+    (engine, storage)
+}
+
+/// One entity per conflict class, plus a command targeting each.
+///
+/// The names mirror `docs/spec.md` §6's own examples: grades are institution truth, reflections
+/// are owner drafts, submissions are an append-only stream.
+pub fn register_defaults(registry: &mut credsync_core::Registry) {
+    for (entity, class) in [
+        ("reflections", ConflictClass::OwnerDraft),
+        ("grades", ConflictClass::ServerAuthoritative),
+        ("submissions", ConflictClass::AppendOnly),
+    ] {
+        registry.register_entity(EntityRegistration {
+            entity: EntityName::new(entity).expect("valid entity"),
+            scope: scope(),
+            conflict_class: class,
+            schema_version: schema(),
+        });
+    }
+    for (command, entity) in [
+        ("submit_reflection", "reflections"),
+        ("amend_grade", "grades"),
+        ("add_submission", "submissions"),
+    ] {
+        registry.register_command(
+            CommandName::new(command).expect("valid name"),
+            EntityName::new(entity).expect("valid entity"),
+        );
+    }
+}
+
+/// A command with an explicit name, for registry tests.
+#[must_use]
+pub fn named_command(n: u8, name: &str) -> Command {
+    Command {
+        name: CommandName::new(name).expect("valid name"),
+        ..command(n, 8)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
