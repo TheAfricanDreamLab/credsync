@@ -23,8 +23,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 
 [dev-dependencies]
-credsync-protocol = { path = "../credsync-protocol" }
-credsync-server = { path = "../credsync-server" }
+credsync-protocol = { version = "0.0.1", path = "../credsync-protocol" }
+credsync-server = { version = "0.0.1", path = "../credsync-server" }
 jsonwebtoken = "9"
 serde_json = "1.0.151"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

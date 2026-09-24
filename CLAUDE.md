@@ -113,7 +113,7 @@ Pick the weakest tool that actually proves the claim:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
-cargo deny check licenses
+cargo deny check licenses bans sources advisories   # all four; CI runs all four
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
