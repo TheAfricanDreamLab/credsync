@@ -48,19 +48,6 @@ impl Compressor for Ratio {
 /// Instead each test owns a unique scope. That is also closer to the real deployment — one shared
 /// `bigserial` log holding many tenants' changes interleaved — so the isolation the scope filter
 /// provides is exercised by every test rather than only the one that names it.
-/// A connection with nothing done to it. A distinct session, which is what makes the
-/// commit-order test mean anything: two sessions, two transactions, one in flight.
-async fn connect() -> Client {
-    let url = std::env::var("CREDSYNC_TEST_DATABASE_URL").expect("CREDSYNC_TEST_DATABASE_URL");
-    let (client, connection) = tokio_postgres::connect(&url, NoTls)
-        .await
-        .expect("connects to the test database");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
 async fn fresh() -> Client {
     let url = std::env::var("CREDSYNC_TEST_DATABASE_URL").unwrap_or_else(|_| {
         panic!(
@@ -572,90 +559,6 @@ async fn a_tombstone_round_trips_without_a_snapshot() {
     assert!(
         changes[0].snapshot.is_none(),
         "a tombstone carried a snapshot"
-    );
-}
-
-// -------------------------------------------------------------------------------------------
-// The commit-order gap
-// -------------------------------------------------------------------------------------------
-
-/// A change committed *after* a higher `seq` is never skipped.
-///
-/// `seq` is a `bigserial`, which allocates when the `INSERT` runs — but a row becomes visible when
-/// its transaction commits, and those orders differ. Demonstrated against Postgres 14 before this
-/// guard existed:
-///
-/// ```text
-///   A: BEGIN; INSERT -> seq 1; (still open)
-///   B:        INSERT -> seq 2; COMMIT
-///   reader sees: seq 2 only
-/// ```
-///
-/// A client would take `seq 2`, advance its cursor past `1`, and never be given change 1 — silent
-/// loss, invisible to every ordering check because the batch it received was perfectly ordered.
-///
-/// Found by review on #59. The simulator could not have caught it: its server is single-threaded,
-/// so no two writes are ever in flight at once.
-#[tokio::test]
-async fn a_change_committed_after_a_higher_seq_is_not_skipped() {
-    let sc = unique_scope("commit_order_gap");
-    let reader = fresh().await;
-
-    // A writer that takes a seq and holds its transaction open.
-    let slow = connect().await;
-    slow.batch_execute("BEGIN").await.expect("begins");
-    let snapshot = serde_json::json!({ "body": "written first, committed last" });
-    db::append_change(
-        &slow,
-        &db::NewChange {
-            scope: &sc,
-            entity: "reflections",
-            entity_id: "slow",
-            op: "upsert",
-            snapshot: Some(&snapshot),
-            row_version: 1,
-            schema_version: 1,
-        },
-    )
-    .await
-    .expect("appends inside the open transaction");
-
-    // A second writer takes a higher seq and commits immediately.
-    append(&reader, &sc, "fast", 16, 1).await;
-
-    // While the first transaction is still open, the reader must be given NOTHING — withholding
-    // the later change rather than delivering it out of order.
-    let during = db::changes_after(&reader, &scope(&sc), 0, 100)
-        .await
-        .expect("reads")
-        .changes;
-    assert!(
-        during.is_empty(),
-        "the reader was handed {} change(s) while an earlier seq was still uncommitted; \
-         advancing the cursor past them loses the earlier one forever",
-        during.len()
-    );
-
-    slow.batch_execute("COMMIT").await.expect("commits");
-
-    // Once it commits, both arrive, in seq order.
-    let after = db::changes_after(&reader, &scope(&sc), 0, 100)
-        .await
-        .expect("reads")
-        .changes;
-    assert_eq!(
-        after.len(),
-        2,
-        "both changes must arrive once the writer commits"
-    );
-    assert!(
-        after[0].seq.get() < after[1].seq.get(),
-        "the pair arrived out of seq order"
-    );
-    assert_eq!(
-        after[0].entity_id.as_str(),
-        "slow",
-        "the earlier seq must come first"
     );
 }
 

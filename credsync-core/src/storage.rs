@@ -108,6 +108,41 @@ pub enum StorageOp {
         payload: Payload,
     },
 
+    /// Record how many times a scope has diverged, so escalation survives a restart.
+    ///
+    /// **Durable on purpose.** The count exists to stop a scope being rebuilt forever, and the
+    /// device that most needs stopping is the one crash-looping — which restarts between every
+    /// attempt. An in-memory count would reset each time and the loop would run for the life of the
+    /// install, re-downloading the same scope on a data budget the user is paying for.
+    RecordDivergence {
+        /// The scope that diverged.
+        scope: ScopeId,
+        /// How many times it has now diverged.
+        attempts: u32,
+    },
+
+    /// Drop every row of a scope, for a re-bootstrap after divergence. `docs/spec.md` §5.
+    ///
+    /// **Required, not an optimisation.** A fresh bootstrap (`after = 0`) carries no tombstones —
+    /// a device starting from nothing has no row to delete — so rows this client holds that the
+    /// server no longer has would survive the rebuild and keep the digest wrong forever. Clearing
+    /// first is what makes the rebuild a rebuild rather than a merge.
+    ///
+    /// Scoped, because a tainted scope must not disturb the others (`docs/spec.md` §5). The
+    /// outbox is **not** touched: those commands have not been sent yet, and losing them to fix a
+    /// read-side problem would be the cure doing more damage than the disease.
+    ClearScope {
+        /// The scope whose cursor and digest are being reset.
+        scope: ScopeId,
+        /// The entities mapped to that scope, whose rows are to be dropped.
+        ///
+        /// Carried rather than looked up, because an adapter does not hold the registry and rows
+        /// are keyed by `(entity, entity_id)` — `docs/spec.md` §1 maps each entity to exactly one
+        /// scope, so this list is that mapping read backwards. An op that expected the adapter to
+        /// know it would be an op every adapter could implement differently.
+        entities: Vec<EntityName>,
+    },
+
     /// Set a row aside because it could not be migrated, keeping the original bytes.
     ///
     /// `docs/spec.md` §7 requires the client to apply registered up-migrations. When one is

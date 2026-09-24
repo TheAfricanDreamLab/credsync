@@ -57,6 +57,8 @@ pub struct FakeStorage {
     pub recovered: Vec<(CommandId, EntityName, Payload)>,
     /// Rows set aside because they could not be migrated, with the bytes exactly as they arrived.
     pub quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
+    /// How many times each scope has diverged, so escalation survives a restart.
+    pub divergences: BTreeMap<ScopeId, u32>,
 }
 
 impl FakeStorage {
@@ -125,6 +127,7 @@ impl FakeStorage {
             resolved: self.resolved.clone(),
             recovered: self.recovered.clone(),
             quarantine: self.quarantine.clone(),
+            divergences: self.divergences.clone(),
         };
 
         for op in ops {
@@ -172,6 +175,16 @@ impl FakeStorage {
                     s.recovered
                         .push((*command_id, entity.clone(), payload.clone()));
                 }
+                StorageOp::RecordDivergence { scope, attempts } => {
+                    s.divergences.insert(scope.clone(), *attempts);
+                }
+                StorageOp::ClearScope { scope, entities } => {
+                    // Rows only. The outbox belongs to the write path and survives a rebuild of
+                    // the read path -- see `Engine::begin_rebootstrap`.
+                    s.rows.retain(|(entity, _), _| !entities.contains(entity));
+                    s.cursors.remove(scope);
+                    s.digests.remove(scope);
+                }
                 StorageOp::QuarantineRow {
                     entity_id,
                     snapshot,
@@ -208,6 +221,7 @@ pub struct Snapshotted {
     resolved: Vec<(CommandId, credsync_core::Resolution)>,
     recovered: Vec<(CommandId, EntityName, Payload)>,
     quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
+    divergences: BTreeMap<ScopeId, u32>,
 }
 
 impl Storage for FakeStorage {
@@ -230,6 +244,7 @@ impl Storage for FakeStorage {
         self.resolved = staged.resolved;
         self.recovered = staged.recovered;
         self.quarantine = staged.quarantine;
+        self.divergences = staged.divergences;
         self.commits += 1;
         Ok(TxOutcome::new(ops.len()))
     }

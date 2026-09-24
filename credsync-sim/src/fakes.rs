@@ -16,7 +16,7 @@ use credsync_core::{
 };
 use credsync_protocol::{
     Command, CommandId, Cursor, EntityId, EntityName, HexString, Payload, RowVersion,
-    SchemaVersion, ScopeId, Snapshot,
+    SchemaVersion, ScopeDigest, ScopeId, Snapshot,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -175,6 +175,8 @@ pub struct Db {
     /// written unreadable or discarded. The original snapshot is kept so a later app version that
     /// knows the migration can recover it — which is the only reason to keep it.
     pub quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
+    /// How many times each scope has diverged, so escalation survives a restart.
+    pub divergences: BTreeMap<ScopeId, u32>,
     /// Every command id this device has ever enqueued.
     ///
     /// The outbox drains and `resolved` only grows for commands that got an answer, so neither
@@ -184,6 +186,26 @@ pub struct Db {
 }
 
 impl Db {
+    /// The digest this device's rows actually imply, computed from scratch.
+    ///
+    /// The engine's own digest is **incremental and in memory** — it describes what the engine
+    /// believes it applied, not what storage holds. That is the right design for the hot path, and
+    /// it means storage corruption happening behind the engine's back is invisible to it until
+    /// something recomputes.
+    ///
+    /// This is that recomputation: what a careful adapter does at start-up to check its stored
+    /// rows against its stored digest, and what makes silent corruption detectable at all.
+    #[must_use]
+    pub fn digest_over_rows(&self, scope: &ScopeId, entities: &[EntityName]) -> ScopeDigest {
+        let _ = scope;
+        ScopeDigest::from_rows(
+            self.rows
+                .iter()
+                .filter(|((entity, _), _)| entities.contains(entity))
+                .map(|((entity, entity_id), row)| (entity, entity_id, row.row_version)),
+        )
+    }
+
     /// Every command id this device has ever enqueued.
     #[must_use]
     pub fn enqueued_ids(&self) -> Vec<CommandId> {
@@ -208,6 +230,7 @@ impl Db {
             commits: self.commits,
             enqueued: self.enqueued.clone(),
             quarantine: self.quarantine.clone(),
+            divergences: self.divergences.clone(),
         }
     }
 
@@ -224,6 +247,7 @@ impl Db {
             commits: self.commits,
             enqueued: self.enqueued.clone(),
             quarantine: self.quarantine.clone(),
+            divergences: self.divergences.clone(),
         };
 
         for op in ops {
@@ -267,6 +291,18 @@ impl Db {
                     next.outbox.retain(|(c, _)| c.id != *id);
                     next.resolved.push((*id, resolution.clone()));
                 }
+                StorageOp::RecordDivergence { scope, attempts } => {
+                    next.divergences.insert(scope.clone(), *attempts);
+                }
+                StorageOp::ClearScope { scope, entities } => {
+                    // Rows, cursor and digest. The outbox survives: those commands have not
+                    // reached the server, and discarding them to fix a read-side problem would be
+                    // the cure doing more damage than the disease.
+                    next.rows
+                        .retain(|(entity, _), _| !entities.contains(entity));
+                    next.cursors.remove(scope);
+                    next.digests.remove(scope);
+                }
                 StorageOp::QuarantineRow {
                     entity_id,
                     snapshot,
@@ -289,6 +325,11 @@ impl Db {
                     next.recovered
                         .push((*command_id, entity.clone(), payload.clone()));
                 }
+                // `StorageOp` is `#[non_exhaustive]`, so this arm has to exist -- which makes it
+                // the place a new op goes to die quietly. That is not hypothetical: `ClearScope`
+                // landed here at CS-22 and was silently ignored, so a rebuild cleared nothing and
+                // the test that caught it read like a protocol bug. Every variant above is handled
+                // explicitly for that reason.
                 _ => {}
             }
         }
