@@ -39,6 +39,12 @@ type RowHistory = BTreeMap<ScopeId, BTreeMap<RowKey, RowVersions>>;
 struct LogEntry {
     seq: Seq,
     change: Change,
+    /// Whether a reader can see this entry yet.
+    ///
+    /// `seq` is allocated when a write *starts*; a row becomes visible when its transaction
+    /// *commits*, and those two orders differ. Modelling only the first left the simulator blind
+    /// to a whole class of bug — see [`Server::commit_order_guard`].
+    visible: bool,
 }
 
 /// What the server decided about a command, kept for replays.
@@ -83,6 +89,27 @@ pub struct Server {
     /// table is a table, not a cache — but it does lose any in-memory batching state, which is
     /// what `server_restart` exercises.
     pub warm: bool,
+
+    /// Entries that have taken a `seq` and not committed yet, with how many steps remain.
+    ///
+    /// Models a writer holding a transaction open. Deterministic: the delay comes from the run
+    /// seed, never from a real clock or a real thread, so a seed still replays exactly.
+    in_flight: Vec<(usize, u32)>,
+
+    /// How long the next write should stay uncommitted. Consumed by the next append.
+    hold_next: u32,
+
+    /// Whether pull stops at the first uncommitted entry.
+    ///
+    /// **This is D-063's fix, and turning it off is how the simulator demonstrates the bug it
+    /// now exists to catch.** With it off, a pull hands over every *visible* entry even when a
+    /// lower `seq` is still in flight — so a client advances its cursor past a change it will
+    /// never be given.
+    ///
+    /// The client cannot defend itself. `seq` is sparse by design (D-040), so from the client's
+    /// side a gap left by an uncommitted write is indistinguishable from a neighbouring scope's
+    /// entry. This has to be fixed on the server or not at all.
+    pub commit_order_guard: bool,
 }
 
 impl Server {
@@ -98,6 +125,9 @@ impl Server {
             next_seq: 1,
             command_targets: BTreeMap::new(),
             warm: true,
+            in_flight: Vec::new(),
+            hold_next: 0,
+            commit_order_guard: true,
         }
     }
 
@@ -105,6 +135,37 @@ impl Server {
     pub fn register_command(&mut self, name: &str, entity: EntityName, scope: ScopeId) {
         self.command_targets
             .insert(name.to_owned(), (entity, scope));
+    }
+
+    /// Makes the next write take its `seq` now and commit `delay` steps later.
+    ///
+    /// What a writer holding a transaction open looks like from a reader's side.
+    pub const fn hold_next_write(&mut self, delay: u32) {
+        self.hold_next = if delay == 0 { 1 } else { delay };
+    }
+
+    /// Advances every in-flight write, committing those whose delay has run out.
+    ///
+    /// Commits happen in delay order rather than `seq` order, which is the entire point: a later
+    /// `seq` can become visible before an earlier one.
+    pub fn advance_commits(&mut self) {
+        let mut waiting = Vec::with_capacity(self.in_flight.len());
+        for (index, remaining) in std::mem::take(&mut self.in_flight) {
+            if remaining <= 1 {
+                if let Some(entry) = self.log.get_mut(index) {
+                    entry.visible = true;
+                }
+            } else {
+                waiting.push((index, remaining - 1));
+            }
+        }
+        self.in_flight = waiting;
+    }
+
+    /// How many writes have taken a `seq` and not yet committed.
+    #[must_use]
+    pub fn in_flight_writes(&self) -> usize {
+        self.in_flight.len()
     }
 
     /// Restarts with a cold cache.
@@ -119,10 +180,30 @@ impl Server {
     /// The server's own digest for a scope, which the client compares against after applying.
     #[must_use]
     pub fn digest(&self, scope: &ScopeId) -> ScopeDigest {
-        let Some(rows) = self.rows.get(scope) else {
-            return ScopeDigest::EMPTY;
+        // Over what a reader can actually see. A digest including uncommitted writes would report
+        // divergence against every client that is correctly up to date.
+        let rows = self.rows_at(scope, self.visible_head(scope));
+        ScopeDigest::from_rows(rows.iter().map(|(e, i, v)| (e, i, *v)))
+    }
+
+    /// The highest `seq` in a scope with every earlier entry committed.
+    ///
+    /// Where a correct client's cursor can reach. Beyond it sits an uncommitted write, and a
+    /// cursor past that is a cursor that skipped it.
+    #[must_use]
+    pub fn visible_head(&self, scope: &ScopeId) -> u64 {
+        let Some(indices) = self.by_scope.get(scope) else {
+            return 0;
         };
-        ScopeDigest::from_rows(rows.iter().map(|((e, i), v)| (e, i, *v)))
+        let mut head = 0;
+        for &i in indices {
+            let entry = &self.log[i];
+            if !entry.visible {
+                break;
+            }
+            head = entry.seq.get();
+        }
+        head
     }
 
     /// The highest `seq` in the log.
@@ -151,13 +232,33 @@ impl Server {
                 });
                 let available = indices.map_or(0, |ix| ix.len() - start);
 
+                // Visibility, and what a reader is allowed to do about a gap in it.
+                //
+                // With the guard on (D-063), the walk stops at the first uncommitted entry: a
+                // later `seq` is withheld rather than handed over ahead of an earlier one, and
+                // arrives on the next pull instead.
+                //
+                // With it off, every visible entry goes regardless — which is what an unguarded
+                // `seq > cursor` query does, and which loses the earlier change permanently once
+                // the client advances past it.
                 let changes: Vec<Change> = indices
                     .into_iter()
-                    .flat_map(|ix| ix[start..].iter().take(limit))
-                    .map(|&i| self.log[i].change.clone())
+                    .flat_map(|ix| ix[start..].iter())
+                    .map_while(|&i| {
+                        let entry = &self.log[i];
+                        if entry.visible {
+                            Some(Some(entry.change.clone()))
+                        } else if self.commit_order_guard {
+                            None
+                        } else {
+                            Some(None)
+                        }
+                    })
+                    .flatten()
+                    .take(limit)
                     .collect();
 
-                let has_more = available > limit;
+                let has_more = available > changes.len();
 
                 // `next_cursor` covers exactly what was sent. A server that advanced it past
                 // undelivered changes would silently skip them; one that left it short would wedge
@@ -188,19 +289,18 @@ impl Server {
     /// An empty batch still moves the cursor to the log head, so a device subscribed to a quiet
     /// scope does not re-ask about the same empty range forever.
     fn head_for(&self, scope: &ScopeId, after: u64) -> u64 {
-        self.by_scope
-            .get(scope)
-            .and_then(|ix| ix.last())
-            .map_or(after, |&i| self.log[i].seq.get())
-            .max(after)
+        // The **visible** head, not the log head. Advancing an empty batch's cursor to the log
+        // head would carry it past a write that has taken a `seq` and not committed — and that
+        // change would then never be delivered, which is precisely the loss the guard exists to
+        // prevent. An empty batch is the easiest place to reintroduce it, because nothing was
+        // sent and the cursor moves anyway.
+        self.visible_head(scope).max(after)
     }
 
     /// Every row a client at `cursor` should be holding, with the version it should be at.
     ///
     /// The authoritative answer to "what should this device have", which is what makes durable
-    /// *effects* checkable rather than only durable verdicts. A device that recorded a command as
-    /// applied while its row quietly vanished passes every check that inspects only the resolution
-    /// log.
+    /// *effects* checkable rather than only durable verdicts.
     #[must_use]
     pub fn rows_at(&self, scope: &ScopeId, cursor: u64) -> Vec<(EntityName, EntityId, RowVersion)> {
         let Some(history) = self.row_history.get(scope) else {
@@ -229,14 +329,12 @@ impl Server {
         entity_id: &EntityId,
         cursor: u64,
     ) -> Option<RowVersion> {
-        let indices = self.by_scope.get(scope)?;
-        indices.iter().rev().find_map(|&i| {
-            let e = &self.log[i];
-            (e.seq.get() <= cursor
-                && e.change.entity == *entity
-                && e.change.entity_id == *entity_id)
-                .then_some(e.change.row_version)
-        })
+        let versions = self
+            .row_history
+            .get(scope)?
+            .get(&(entity.clone(), entity_id.clone()))?;
+        let idx = versions.partition_point(|(seq, _)| *seq <= cursor);
+        (idx > 0).then(|| versions[idx - 1].1)
     }
 
     /// Applies a push, deduping replays and recording every outcome.
@@ -385,8 +483,14 @@ impl Server {
             .entry((entity.clone(), entity_id.clone()))
             .or_default()
             .push((seq.get(), row_version));
+
+        let held = std::mem::take(&mut self.hold_next);
+        if held > 0 {
+            self.in_flight.push((self.log.len(), held));
+        }
         self.log.push(LogEntry {
             seq,
+            visible: held == 0,
             change: Change {
                 seq,
                 entity: entity.clone(),
