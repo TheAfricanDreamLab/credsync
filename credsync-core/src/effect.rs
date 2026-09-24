@@ -60,6 +60,22 @@ pub enum Telemetry {
         reason: String,
     },
 
+    /// The server refused this client's protocol version. `docs/spec.md` §7.
+    ///
+    /// Carries `queued` so the prompt can say what is at stake. "Please update to continue" is
+    /// ignorable; "please update — 14 edits are waiting to sync" is not, and the difference matters
+    /// because the work is safe only for as long as the user keeps the app installed.
+    UpgradeRequired {
+        /// The oldest protocol the server still accepts.
+        min_protocol: credsync_protocol::ProtocolVersion,
+        /// The version the server prefers.
+        current_protocol: credsync_protocol::ProtocolVersion,
+        /// The server's explanation, for the prompt.
+        reason: credsync_protocol::Reason,
+        /// How many commands are waiting, so the prompt can say so.
+        queued: usize,
+    },
+
     /// A queued command could not be migrated forward, so it was held rather than sent.
     ///
     /// **Held, not dropped.** `docs/spec.md` §7: *"A command whose schema the server no longer

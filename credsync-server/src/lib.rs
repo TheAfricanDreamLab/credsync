@@ -38,6 +38,7 @@ pub mod dedupe;
 pub mod error;
 pub mod host;
 pub mod pull;
+pub mod version;
 
 pub use auth::{AuthError, Claims, Verifier};
 #[cfg(feature = "postgres")]
@@ -48,3 +49,4 @@ pub use dedupe::{Decision, DedupeStats, Recorded, decide};
 pub use error::ServerError;
 pub use host::{Forwarded, Host, HostError, HostOutcome};
 pub use pull::{ChangeRow, Compressor, DEFAULT_BUDGET_BYTES, fill_batch};
+pub use version::{Negotiated, VersionPolicy};

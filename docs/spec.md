@@ -172,9 +172,9 @@ documentation.
 
 ## 7. Versioning
 
-- **`protocol` on every request.** The server speaks N and N−1. Below N−1 it responds `426` with
-  a forced-upgrade envelope the client core understands. The client then **queues its outbox and
-  surfaces an upgrade prompt — it never drops queued work.**
+- **`protocol` on every request.** The server speaks N and N−1; outside that window, above or
+  below, it returns `426` with an envelope carrying both bounds. The client then **queues its
+  outbox and surfaces an upgrade prompt — it never drops queued work.**
 - **Per-entity `schema_version` in every snapshot.** The client applies registered up-migrations
   to local rows. Migration composition is associative: v1→v2→v3 equals v1→v3.
 - **Outbox entries record the schema version they were authored under.** An upgraded app migrates
