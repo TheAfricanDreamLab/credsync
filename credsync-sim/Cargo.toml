@@ -29,4 +29,5 @@ credsync-server   = { path = "../credsync-server", version = "0.0.1", default-fe
 serde_json = "1"
 
 [dev-dependencies]
+credsync-server = { version = "0.0.1", path = "../credsync-server", default-features = false }
 serde_json = "1"

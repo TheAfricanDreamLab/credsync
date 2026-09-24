@@ -19,8 +19,8 @@ use crate::traits::{Clock, Compressor, Entropy, Storage, Transport};
 use core::fmt;
 use credsync_protocol::{
     Batch, BootstrapResponse, Change, Command, CommandId, ConflictClass, EntityId, EntityName,
-    Payload, ProtocolVersion, PushRequest, PushResponse, Reason, SchemaVersion, ScopeId, Snapshot,
-    Status, canonical, limits,
+    ForcedUpgrade, Payload, ProtocolVersion, PushRequest, PushResponse, Reason, SchemaVersion,
+    ScopeId, Snapshot, Status, canonical, limits,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -88,6 +88,12 @@ where
     registry: Registry,
     /// The host's registered up-migrations. `docs/spec.md` §7.
     migrations: Migrations,
+    /// Set when the server has refused this client's protocol version.
+    ///
+    /// While set, nothing is pushed: the server has already said it will not accept this version,
+    /// so sending would burn battery and bandwidth to be refused again. The outbox is untouched —
+    /// see `on_upgrade_required` for why that is the whole point.
+    upgrade_required: Option<ForcedUpgrade>,
 }
 
 impl<C, E, S, T, Z> Engine<C, E, S, T, Z>
@@ -111,6 +117,7 @@ where
             outbox: VecDeque::new(),
             registry: Registry::default(),
             migrations: Migrations::new(),
+            upgrade_required: None,
         }
     }
 
@@ -371,6 +378,49 @@ where
         }))
     }
 
+    /// Records that the server refused this client's protocol version. `docs/spec.md` §7.
+    ///
+    /// # Nothing is dropped, and that is the entire point
+    ///
+    /// The spec is explicit: *"The client then queues its outbox and surfaces an upgrade prompt —
+    /// it never drops queued work."*
+    ///
+    /// So this method deliberately does **nothing to the outbox**. It sets a flag and emits a
+    /// prompt. The queued commands stay exactly where they are, on disk, waiting for an app version
+    /// the server will talk to — which may be days away, and which is precisely when a user would
+    /// be least forgiving about losing three weeks of writing.
+    ///
+    /// The flag stops further pushes. That is not an optimisation: the server has already said it
+    /// will not accept this version, so every push until the update lands is a round trip that can
+    /// only be refused, on a device that is often paying for its data by the megabyte.
+    ///
+    /// Pull is left alone. Reading is still useful to a user who cannot write — seeing today's
+    /// timetable while being told the app needs updating is a better experience than a blank
+    /// screen, and the server refuses the request itself if it disagrees.
+    pub fn on_upgrade_required(&mut self, envelope: &ForcedUpgrade) {
+        self.upgrade_required = Some(envelope.clone());
+        self.emit(Effect::Emit(Telemetry::UpgradeRequired {
+            min_protocol: envelope.min_protocol,
+            current_protocol: envelope.current_protocol,
+            reason: envelope.reason.clone(),
+            queued: self.outbox.len(),
+        }));
+    }
+
+    /// The upgrade the server is asking for, if it has refused this client.
+    #[must_use]
+    pub const fn upgrade_required(&self) -> Option<&ForcedUpgrade> {
+        self.upgrade_required.as_ref()
+    }
+
+    /// Clears the forced-upgrade state, after the app has been updated.
+    ///
+    /// The outbox is untouched here too: whatever was queued when the server refused is what this
+    /// newly-updated app now gets to send.
+    pub fn upgrade_completed(&mut self) {
+        self.upgrade_required = None;
+    }
+
     /// Queues a client write.
     ///
     /// `docs/spec.md` §3.3 and D-004: client writes are **commands, never row writes**. The entry
@@ -448,6 +498,12 @@ where
         protocol: ProtocolVersion,
         budget_bytes: usize,
     ) -> Result<Option<PushRequest>, OutboxError> {
+        // The server has already refused this protocol version, so a push can only be refused
+        // again. The outbox is left exactly as it is — see `on_upgrade_required`.
+        if self.upgrade_required.is_some() {
+            return Ok(None);
+        }
+
         if self.outbox.is_empty() {
             return Ok(None);
         }
