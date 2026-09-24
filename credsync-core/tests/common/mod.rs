@@ -269,6 +269,15 @@ impl Storage for SharedStorage {
 pub struct FakeCompressor {
     pub divisor: usize,
     pub calls: Rc<Cell<usize>>,
+    /// The last buffer this compressor was asked to measure, when recording is on.
+    ///
+    /// `build_push` hands it the real candidate bytes, so recording them is how a test checks
+    /// that the incrementally spliced buffer matches a whole-list encode (#53).
+    ///
+    /// **Off by default.** Recording copies the whole candidate buffer on every call, which is
+    /// O(n^2) copying across a batch — enough to swamp a measurement of whether `build_push`
+    /// itself is linear. The instrument has to stay out of what it is measuring.
+    pub last_seen: Option<Rc<RefCell<Vec<u8>>>>,
 }
 
 impl FakeCompressor {
@@ -277,6 +286,7 @@ impl FakeCompressor {
         Self {
             divisor: divisor.max(1),
             calls: Rc::new(Cell::new(0)),
+            last_seen: None,
         }
     }
 }
@@ -287,9 +297,28 @@ impl Default for FakeCompressor {
     }
 }
 
+impl FakeCompressor {
+    /// The same compressor, keeping a copy of each buffer it is handed.
+    ///
+    /// For the byte-equivalence test and nothing else: see [`last_seen`](Self::last_seen) for why
+    /// this is not the default.
+    #[must_use]
+    pub fn recording(divisor: usize) -> Self {
+        Self {
+            last_seen: Some(Rc::new(RefCell::new(Vec::new()))),
+            ..Self::with_ratio(divisor)
+        }
+    }
+}
+
 impl Compressor for FakeCompressor {
     fn compressed_len(&self, bytes: &[u8]) -> usize {
         self.calls.set(self.calls.get() + 1);
+        if let Some(seen) = &self.last_seen {
+            let mut seen = seen.borrow_mut();
+            seen.clear();
+            seen.extend_from_slice(bytes);
+        }
         bytes.len().div_ceil(self.divisor)
     }
 }

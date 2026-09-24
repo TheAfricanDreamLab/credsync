@@ -676,3 +676,160 @@ fn applied_state_is_silent_on_a_healthy_run() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Server::rows_at at historical cursors
+//
+// Review found (#58) that `rows_at` was only ever exercised at the log head, so the binary
+// search's `versions[idx - 1]` branch — the one that answers "what did this row look like *then*"
+// — was untested. That branch is what the durable-effects and applied-state invariants rest on for
+// any device that is behind, which is every device on a bad link.
+// ---------------------------------------------------------------------------------------------
+
+/// A row written twice reads back at the right version for every cursor position.
+#[test]
+fn rows_at_answers_correctly_before_between_and_after_two_writes() {
+    let mut server = Server::new();
+    let entity = EntityName::new("reflections").expect("valid entity");
+    server.register_command("submit_reflection", entity.clone(), scope());
+
+    let mut rng = credsync_sim::Rng::new(4);
+    // Three writes; the middle two land on whatever row the seeded generator picks, so the test
+    // asks the server which row rather than assuming one.
+    server.external_change(&scope(), &entity, &mut rng);
+    let after_first = server.head();
+    server.external_change(&scope(), &entity, &mut rng);
+    let after_second = server.head();
+    server.external_change(&scope(), &entity, &mut rng);
+    let after_third = server.head();
+
+    // Before anything was written: nothing exists yet.
+    assert!(
+        server.rows_at(&scope(), 0).is_empty(),
+        "a cursor of 0 saw rows that had not been written"
+    );
+
+    // At each cursor, every row reported must be at a version no greater than that cursor, and
+    // the set must only grow as the cursor advances.
+    let mut previous = 0usize;
+    for cursor in [after_first, after_second, after_third] {
+        let rows = server.rows_at(&scope(), cursor);
+        assert!(
+            !rows.is_empty(),
+            "cursor {cursor} saw no rows despite {cursor} changes"
+        );
+        for (_, _, version) in &rows {
+            assert!(
+                version.get() <= cursor,
+                "cursor {cursor} reported a row at version {}, which had not happened yet",
+                version.get()
+            );
+        }
+        assert!(
+            rows.len() >= previous,
+            "the row set shrank as the cursor advanced"
+        );
+        previous = rows.len();
+    }
+
+    // A cursor past the head sees exactly what the head sees; there is nothing beyond it.
+    assert_eq!(
+        server.rows_at(&scope(), after_third),
+        server.rows_at(&scope(), after_third + 1_000),
+        "a cursor past the head invented rows"
+    );
+}
+
+/// A row overwritten in place reads back at its earlier version for an earlier cursor.
+///
+/// The precise claim the binary search makes, and the one a head-only test cannot check.
+#[test]
+fn rows_at_reports_the_earlier_version_for_an_earlier_cursor() {
+    let mut server = Server::new();
+    let entity = EntityName::new("reflections").expect("valid entity");
+    server.register_command("submit_reflection", entity.clone(), scope());
+
+    // Drive the generator until one row has been written twice, then compare the two cursors.
+    let mut rng = credsync_sim::Rng::new(11);
+    let mut first_seen: Option<(EntityId, u64)> = None;
+    for _ in 0..40 {
+        server.external_change(&scope(), &entity, &mut rng);
+        let head = server.head();
+        let rows = server.rows_at(&scope(), head);
+
+        if let Some((id, earlier_cursor)) = &first_seen {
+            let now = rows
+                .iter()
+                .find(|(_, i, _)| i == id)
+                .map(|(_, _, v)| v.get());
+            let then = server
+                .rows_at(&scope(), *earlier_cursor)
+                .iter()
+                .find(|(_, i, _)| i == id)
+                .map(|(_, _, v)| v.get());
+
+            if let (Some(now), Some(then)) = (now, then)
+                && now != then
+            {
+                assert!(
+                    then < now,
+                    "the earlier cursor reported a later version: {then} vs {now}"
+                );
+                return;
+            }
+        } else if let Some((_, id, _)) = rows.first() {
+            first_seen = Some((id.clone(), head));
+        }
+    }
+
+    panic!("no row was written twice in 40 changes; the test proved nothing");
+}
+
+/// Writes to one scope never change what another scope reports.
+///
+/// The first version of this test asserted that no `entity_id` appeared in both scopes, and
+/// failed — correctly. Both scopes draw ids from the same small pool, so `row:7` existing in each
+/// is not a leak: they are different rows that happen to share a name, which is exactly what a
+/// scope is for. The claim worth checking is that one scope's writes do not move the other's
+/// answers.
+#[test]
+fn writes_to_one_scope_never_change_another() {
+    let mut server = Server::new();
+    let entity = EntityName::new("reflections").expect("valid entity");
+    let other = ScopeId::new("inst:somebody-else").expect("valid scope");
+    server.register_command("submit_reflection", entity.clone(), scope());
+
+    let mut rng = credsync_sim::Rng::new(21);
+    for _ in 0..6 {
+        server.external_change(&scope(), &entity, &mut rng);
+    }
+
+    let head_before = server.head();
+    let mine_before = server.rows_at(&scope(), head_before);
+    assert!(!mine_before.is_empty(), "the setup wrote nothing");
+
+    // Now write only to the other scope, many times.
+    for _ in 0..20 {
+        server.external_change(&other, &entity, &mut rng);
+    }
+
+    assert_eq!(
+        server.rows_at(&scope(), head_before),
+        mine_before,
+        "another scope's writes changed what this scope reports at the same cursor"
+    );
+    assert_eq!(
+        server.rows_at(&scope(), server.head()),
+        mine_before,
+        "another scope's writes leaked into this scope at the new head"
+    );
+
+    // And a scope that was never written to still has nothing, at any cursor.
+    let untouched = ScopeId::new("inst:never-written").expect("valid scope");
+    for cursor in [0, head_before, server.head()] {
+        assert!(
+            server.rows_at(&untouched, cursor).is_empty(),
+            "a scope with no writes reported rows at cursor {cursor}"
+        );
+    }
+}

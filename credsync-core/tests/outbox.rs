@@ -402,3 +402,41 @@ fn a_rejection_without_a_reason_is_still_dead_lettered() {
         other => panic!("expected a dead letter, got {other:?}"),
     });
 }
+
+// -------------------------------------------------------------------------------------------
+// #53 — build_push is linear in the number of queued commands
+// -------------------------------------------------------------------------------------------
+
+/// The spliced buffer is byte-identical to encoding the whole list at once.
+///
+/// `build_push` grows the candidate batch's canonical bytes in place rather than re-encoding the
+/// list on every iteration. That is only safe if the two agree exactly — the budget is measured
+/// over those bytes, so a splice that produced even slightly different output would mean batches
+/// sized against something that never goes on the wire.
+///
+/// Checked through the compressor, which is handed the real buffer: it records what it was given,
+/// and the test compares that against a from-scratch encode of the chosen commands.
+#[test]
+fn the_incrementally_built_bytes_match_a_from_scratch_encode() {
+    let recorder = FakeCompressor::recording(1);
+    let seen = recorder.last_seen.clone().expect("recording");
+    let (mut engine, _storage) = new_engine_with(recorder);
+
+    for n in 1..=12 {
+        engine.enqueue(entry(n, 20)).expect("enqueues");
+    }
+
+    let push = engine
+        .build_push(protocol(), usize::MAX)
+        .expect("builds")
+        .expect("something to send");
+
+    let from_scratch = credsync_protocol::canonical::to_vec(&push.commands).expect("encodes");
+    let spliced = seen.borrow().clone();
+
+    assert_eq!(
+        String::from_utf8_lossy(&spliced),
+        String::from_utf8_lossy(&from_scratch),
+        "the incrementally spliced bytes drifted from a whole-list encode"
+    );
+}
