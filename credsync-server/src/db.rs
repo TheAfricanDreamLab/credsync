@@ -17,14 +17,50 @@ impl From<tokio_postgres::Error> for ServerError {
     }
 }
 
+/// A fixed key for the advisory lock that serialises migration.
+///
+/// Arbitrary but stable: every process that migrates this schema must pick the same number, or the
+/// lock protects nothing. Derived from "credsync" so a collision with another application's
+/// advisory lock on the same database is unlikely rather than merely hoped for.
+const MIGRATION_LOCK: i64 = 0x0000_c2ed_5900_0001;
+
 /// Applies the schema. Idempotent, so a server may run it on every start.
 ///
+/// # Why this takes a lock
+///
+/// `CREATE TABLE IF NOT EXISTS` is **not** safe to run concurrently. Two sessions can both find
+/// the table absent and both try to create it, and one loses with a duplicate-key error on
+/// `pg_class` — the `IF NOT EXISTS` only skips the work, it does not serialise the check against
+/// the creation.
+///
+/// That is not hypothetical. Several server instances starting at once is the normal deployment,
+/// and it is exactly what happened in CI: eleven integration tests migrating a fresh database
+/// concurrently, three of them failing with `db error`. It passed locally only because the tables
+/// already existed from an earlier run, so every check short-circuited and nothing raced.
+///
+/// A session-level advisory lock serialises the whole migration. It is released explicitly, and
+/// also by the session ending, so a process that dies mid-migration does not wedge the next one.
+///
 /// # Errors
-/// Returns [`ServerError::Database`] if the statements cannot be applied.
+/// Returns [`ServerError::Database`] if the lock cannot be taken or the statements cannot be
+/// applied.
 pub async fn migrate(client: &Client) -> Result<(), ServerError> {
     client
-        .batch_execute(include_str!("../migrations/0001_sync_tables.sql"))
+        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK])
         .await?;
+
+    let applied = client
+        .batch_execute(include_str!("../migrations/0001_sync_tables.sql"))
+        .await;
+
+    // Released whatever happened, so a failed migration does not hold the lock until the session
+    // closes and leave every other instance waiting on it.
+    let unlocked = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK])
+        .await;
+
+    applied?;
+    unlocked?;
     Ok(())
 }
 
