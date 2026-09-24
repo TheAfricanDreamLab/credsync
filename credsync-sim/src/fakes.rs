@@ -169,6 +169,12 @@ pub struct Db {
     pub verdict: StorageVerdict,
     /// Transactions that committed, for the trace.
     pub commits: u64,
+    /// Rows set aside because they could not be migrated, with the bytes exactly as they arrived.
+    ///
+    /// `docs/spec.md` §7: a row whose schema this app cannot reach is quarantined rather than
+    /// written unreadable or discarded. The original snapshot is kept so a later app version that
+    /// knows the migration can recover it — which is the only reason to keep it.
+    pub quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
     /// Every command id this device has ever enqueued.
     ///
     /// The outbox drains and `resolved` only grows for commands that got an answer, so neither
@@ -201,6 +207,7 @@ impl Db {
             verdict: self.verdict,
             commits: self.commits,
             enqueued: self.enqueued.clone(),
+            quarantine: self.quarantine.clone(),
         }
     }
 
@@ -216,6 +223,7 @@ impl Db {
             verdict: StorageVerdict::Commit,
             commits: self.commits,
             enqueued: self.enqueued.clone(),
+            quarantine: self.quarantine.clone(),
         };
 
         for op in ops {
@@ -258,6 +266,20 @@ impl Db {
                 StorageOp::ResolveCommand { id, resolution } => {
                     next.outbox.retain(|(c, _)| c.id != *id);
                     next.resolved.push((*id, resolution.clone()));
+                }
+                StorageOp::QuarantineRow {
+                    entity_id,
+                    snapshot,
+                    schema_version,
+                    reason,
+                    ..
+                } => {
+                    next.quarantine.push((
+                        entity_id.clone(),
+                        snapshot.clone(),
+                        *schema_version,
+                        reason.clone(),
+                    ));
                 }
                 StorageOp::SaveRecoveredDraft {
                     entity,
