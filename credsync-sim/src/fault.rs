@@ -51,6 +51,17 @@ pub struct FaultRates {
     pub server_restart: u32,
     /// Restart a device, reloading its engine from storage.
     pub device_restart: u32,
+    /// Put the server under load, so it sheds by delivering less and processing fewer commands.
+    ///
+    /// Without this the simulator only ever saw a server with spare capacity, so the whole
+    /// question of whether shedding loses acknowledged work was unreachable — every run would
+    /// have been green whatever the shedding code did, because it never ran.
+    ///
+    /// The shedding itself is deliberately *silent*: smaller batches with `has_more`, and results
+    /// for a prefix of the commands. A server that answered "rejected" because it was busy would
+    /// be recording a verdict about work nothing examined (see `pressure`).
+    pub overload: u32,
+
     /// Hold a write's transaction open so it takes a `seq` now and commits later.
     ///
     /// `seq` is allocated when a write starts and the row becomes visible when it commits, so a
@@ -95,6 +106,7 @@ impl Default for FaultRates {
             device_restart: 3,
             protocol_violation: 5,
             slow_commit: 8,
+            overload: 6,
             latency_ms: (20, 2_000),
         }
     }
@@ -117,6 +129,7 @@ impl FaultRates {
             device_restart: 0,
             protocol_violation: 0,
             slow_commit: 0,
+            overload: 0,
             latency_ms: (10, 10),
         }
     }
@@ -153,6 +166,8 @@ pub enum Fault {
     ProtocolViolation,
     /// A write took its `seq` and stayed uncommitted for a while.
     SlowCommit,
+    /// The server went under load and started shedding.
+    Overloaded,
 }
 
 impl Fault {
@@ -173,6 +188,7 @@ impl Fault {
             Self::StorageCommittedThenKilled => "storage-committed-then-killed",
             Self::ServerRestarted => "server-restarted",
             Self::DeviceRestarted => "device-restarted",
+            Self::Overloaded => "overloaded",
             Self::ProtocolViolation => "protocol-violation",
             Self::SlowCommit => "slow-commit",
         }
@@ -182,7 +198,7 @@ impl Fault {
     ///
     /// A `const` list rather than a derived iterator so that adding a variant without adding it
     /// here is visible: the coverage report would show one fewer row than the menu.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Dropped,
         Self::Duplicated,
         Self::Reordered,
@@ -195,6 +211,7 @@ impl Fault {
         Self::DeviceRestarted,
         Self::ProtocolViolation,
         Self::SlowCommit,
+        Self::Overloaded,
     ];
 }
 

@@ -253,6 +253,7 @@ version = "0.0.1"
 dependencies = [
  "credsync-core",
  "credsync-protocol",
+ "credsync-server",
  "serde_json",
 ]
 

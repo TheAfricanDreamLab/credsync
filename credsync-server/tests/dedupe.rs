@@ -4,6 +4,10 @@
 //! "exactly one insert wins under concurrency" and "the record survives a restart", and a mock
 //! would agree with whatever the code expected about both.
 
+// This file needs the `postgres` feature: it drives a real database. With the feature off (which
+// is how `credsync-sim` depends on this crate) it compiles to an empty test binary rather than a
+// build failure.
+#![cfg(feature = "postgres")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use credsync_protocol::{

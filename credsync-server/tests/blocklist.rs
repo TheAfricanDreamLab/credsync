@@ -5,6 +5,10 @@
 //! "a blocked scope is blocked" but **"a blocked scope is cut while holding a perfectly valid,
 //! unexpired token"**, which is the situation it was built for.
 
+// This file needs the `postgres` feature: it drives a real database. With the feature off (which
+// is how `credsync-sim` depends on this crate) it compiles to an empty test binary rather than a
+// build failure.
+#![cfg(feature = "postgres")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use credsync_protocol::ScopeId;

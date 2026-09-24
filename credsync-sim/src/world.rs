@@ -91,6 +91,8 @@ pub struct World {
     pub invariants: Invariants,
     /// A copy of the registry every device was built with, for policy conformance.
     registry: credsync_core::Registry,
+    /// How hard the server is shedding load, and the levers it may pull.
+    pub pressure: crate::pressure::Pressure,
 }
 
 impl World {
@@ -166,7 +168,30 @@ impl World {
             trace,
             invariants: Invariants::new(),
             registry,
+            pressure: crate::pressure::Pressure::new(),
         }
+    }
+
+    /// How many distinct commands the server has recorded an outcome for.
+    #[must_use]
+    pub fn server_answered_commands(&self) -> usize {
+        self.server.answered_commands()
+    }
+
+    /// Whether the server recorded an outcome for this command id.
+    #[must_use]
+    pub fn server_has_answered(&self, id: &CommandId) -> bool {
+        self.server.has_answered(id)
+    }
+
+    /// Every command any device ever enqueued, counted once.
+    #[must_use]
+    pub fn commands_ever_enqueued(&self) -> usize {
+        let mut ids = std::collections::BTreeSet::new();
+        for db in self.databases() {
+            ids.extend(db.borrow().enqueued.iter().copied());
+        }
+        ids.len()
     }
 
     /// How many devices this run has.
@@ -249,6 +274,14 @@ impl World {
         if self.rng.chance(self.rates.server_restart) {
             self.server.restart_cold();
             self.trace.fault(self.now_ms, 0, Fault::ServerRestarted);
+        }
+
+        // Load arrives and eases off on its own schedule, drawn from the seed. Ticked every step
+        // whether or not a new episode starts, so an episode that began earlier ends.
+        self.pressure.tick();
+        if !self.quiet && !self.pressure.is_shedding() && self.rng.chance(self.rates.overload) {
+            self.pressure.overload(&mut self.rng);
+            self.trace.fault(self.now_ms, 0, Fault::Overloaded);
         }
 
         // Somebody else is always writing: another student, a teacher grading. Without this a
@@ -431,14 +464,19 @@ impl World {
 
                 let response = match &out.request {
                     WireRequest::Pull(req) => {
-                        let mut pulled = self.server.pull(req, PULL_LIMIT);
+                        let budget = self.pressure.budget_bytes();
+                        let mut pulled = self.server.pull(req, PULL_LIMIT, budget);
                         if violate && repeat_last_change(&mut pulled) {
                             self.trace.fault(self.now_ms, i, Fault::ProtocolViolation);
                         }
                         Ok(WireResponse::Pull(pulled))
                     }
                     WireRequest::Push(req) => {
-                        let mut pushed = self.server.push(req, &mut self.rng);
+                        // Backpressure: a loaded server looks at a prefix and answers only those. The
+                        // rest stay in the outbox, because the client resolves only ids it is told
+                        // about. It never answers a command it did not process -- see `pressure`.
+                        let accepted = self.pressure.accept_count(req.commands.len());
+                        let mut pushed = self.server.push_prefix(req, accepted, &mut self.rng);
                         if violate && repeat_last_result(&mut pushed) {
                             self.trace.fault(self.now_ms, i, Fault::ProtocolViolation);
                         }

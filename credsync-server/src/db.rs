@@ -9,23 +9,6 @@ use crate::pull::ChangeRow;
 use credsync_protocol::{Change, ScopeId};
 use tokio_postgres::Client;
 
-impl From<tokio_postgres::Error> for ServerError {
-    fn from(e: tokio_postgres::Error) -> Self {
-        // `tokio_postgres::Error` renders as the useless string "db error"; everything worth
-        // knowing -- the SQLSTATE, the constraint name, the message -- lives in its `source`.
-        //
-        // Not a cosmetic complaint. At CS-17 a foreign-key violation surfaced as
-        // `Database { detail: "db error" }` and the cause had to be recovered from the server's
-        // own log. An operator reading a production log does not have that option.
-        use core::error::Error as _;
-        let mut detail = e.to_string();
-        if let Some(cause) = e.source() {
-            detail = format!("{detail}: {cause}");
-        }
-        Self::Database { detail }
-    }
-}
-
 /// A fixed key for the advisory lock that serialises migration.
 ///
 /// Arbitrary but stable: every process that migrates this schema must pick the same number, or the

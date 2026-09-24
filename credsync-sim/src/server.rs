@@ -22,6 +22,7 @@ use credsync_protocol::{
     ProtocolVersion, PullRequest, PullResponse, PushRequest, PushResponse, RowVersion,
     SchemaVersion, ScopeDigest, ScopeId, Seq, Snapshot, Status, payload_checksum,
 };
+use credsync_server::Compressor;
 use std::collections::BTreeMap;
 
 /// Identifies one row: `(entity, entity_id)`. Unique because the registry maps each entity to
@@ -53,6 +54,27 @@ struct DedupeEntry {
     /// The checksum of the body that produced this outcome, so a mutated replay is refused.
     checksum: HexString,
     result: CommandResult,
+}
+
+/// A deterministic stand-in for Brotli or gzip.
+///
+/// The budget is a **compressed**-size budget (`docs/spec.md` §2), so `fill_batch` has to be given
+/// something that compresses. Real compression would be a poor choice here for two reasons: it is
+/// slow enough to matter across thousands of seeds, and it makes the simulator's behaviour depend
+/// on a compression library's version rather than on the run seed.
+///
+/// A fixed ratio is deterministic and monotonic in input length, which is all `fill_batch`
+/// actually relies on: more bytes in, never fewer bytes out. Three-to-one is roughly what gzip
+/// manages on the repetitive JSON these snapshots are.
+///
+/// What this deliberately does **not** model is a pathological input that compresses worse than
+/// the ratio. That belongs with the fuzzing slice, where a hostile snapshot is the point.
+struct SimCompressor;
+
+impl Compressor for SimCompressor {
+    fn compressed_len(&self, bytes: &[u8]) -> usize {
+        bytes.len().div_ceil(3)
+    }
 }
 
 /// The simulated server.
@@ -206,6 +228,22 @@ impl Server {
         head
     }
 
+    /// How many distinct commands the server has recorded an outcome for.
+    ///
+    /// The count of *answers given*. Under backpressure this must equal the number of commands the
+    /// devices actually got results for — a server that shed load by inventing verdicts would show
+    /// more answers here than it ever processed.
+    #[must_use]
+    pub fn answered_commands(&self) -> usize {
+        self.dedupe.len()
+    }
+
+    /// Whether the server has recorded an outcome for this command id.
+    #[must_use]
+    pub fn has_answered(&self, id: &CommandId) -> bool {
+        self.dedupe.contains_key(id)
+    }
+
     /// The highest `seq` in the log.
     #[must_use]
     pub const fn head(&self) -> u64 {
@@ -214,10 +252,28 @@ impl Server {
 
     /// Answers a pull, one batch per requested scope.
     ///
-    /// `limit` caps changes per batch so a device walks forward over several cycles, which is
-    /// what makes `has_more` and cursor handling do any work at all.
+    /// # This calls the real server
+    ///
+    /// Candidate selection — the log walk, the cursor, the commit-order guard — is what a database
+    /// query does, so it is modelled here. **Batching is not modelled.** The compressed byte
+    /// budget, the rule that one oversized change is delivered alone rather than stalling the
+    /// cursor, `has_more`, and where `next_cursor` lands all come from
+    /// [`credsync_server::fill_batch`], the same function `credsyncd` serves from.
+    ///
+    /// That is the point of CS-18. A simulator checking its own reimplementation of the byte
+    /// budget proves the copy correct and says nothing about the code that ships. The two agreed
+    /// when this was written, which is exactly when a second implementation looks harmless.
+    ///
+    /// `row_limit` caps candidates the way the query's `LIMIT` does; `budget_bytes` is the
+    /// compressed budget (`docs/spec.md` §2), shrunk by [`crate::pressure::Pressure`] when the
+    /// server is shedding.
     #[must_use]
-    pub fn pull(&self, request: &PullRequest, limit: usize) -> PullResponse {
+    pub fn pull(
+        &self,
+        request: &PullRequest,
+        row_limit: usize,
+        budget_bytes: usize,
+    ) -> PullResponse {
         let batches = request
             .scopes
             .iter()
@@ -241,7 +297,7 @@ impl Server {
                 // With it off, every visible entry goes regardless — which is what an unguarded
                 // `seq > cursor` query does, and which loses the earlier change permanently once
                 // the client advances past it.
-                let changes: Vec<Change> = indices
+                let candidates: Vec<Change> = indices
                     .into_iter()
                     .flat_map(|ix| ix[start..].iter())
                     .map_while(|&i| {
@@ -255,26 +311,39 @@ impl Server {
                         }
                     })
                     .flatten()
-                    .take(limit)
+                    .take(row_limit)
                     .collect();
 
-                let has_more = available > changes.len();
+                // Whether the row ceiling cut the read short, which `fill_batch` cannot tell from
+                // its side — the same reason `db::changes_after` returns `more_beyond`.
+                let more_beyond = available > candidates.len();
 
-                // `next_cursor` covers exactly what was sent. A server that advanced it past
-                // undelivered changes would silently skip them; one that left it short would wedge
-                // the scope. Both are client-visible, and the client refuses both.
-                let next_cursor = changes
-                    .last()
-                    .map_or_else(|| self.head_for(&sc.scope, after), |c| c.seq.get());
+                let cursor = Cursor::new(after).unwrap_or(Cursor::START);
+                let digest = self.digest(&sc.scope).to_hex();
 
-                Batch {
-                    scope: sc.scope.clone(),
-                    changes,
-                    next_cursor: Cursor::new(next_cursor).unwrap_or(Cursor::START),
-                    has_more,
-                    checksum: hex_placeholder(),
-                    digest: self.digest(&sc.scope).to_hex(),
-                }
+                credsync_server::fill_batch(
+                    &sc.scope,
+                    cursor,
+                    candidates,
+                    more_beyond,
+                    budget_bytes,
+                    &SimCompressor,
+                    digest,
+                )
+                .unwrap_or_else(|_| {
+                    // `fill_batch` only fails when a change cannot be encoded, which cannot happen
+                    // for a change this server itself built from validated wire types. An empty
+                    // batch rather than a panic: a simulator that dies on an impossible branch
+                    // tells you less than one that keeps running and lets an invariant catch it.
+                    Batch {
+                        scope: sc.scope.clone(),
+                        changes: Vec::new(),
+                        next_cursor: cursor,
+                        has_more: more_beyond,
+                        checksum: hex_placeholder(),
+                        digest: self.digest(&sc.scope).to_hex(),
+                    }
+                })
             })
             .collect();
 
@@ -284,18 +353,14 @@ impl Server {
         }
     }
 
-    /// Where a scope's cursor may advance to when nothing was sent.
-    ///
-    /// An empty batch still moves the cursor to the log head, so a device subscribed to a quiet
-    /// scope does not re-ask about the same empty range forever.
-    fn head_for(&self, scope: &ScopeId, after: u64) -> u64 {
-        // The **visible** head, not the log head. Advancing an empty batch's cursor to the log
-        // head would carry it past a write that has taken a `seq` and not committed — and that
-        // change would then never be delivered, which is precisely the loss the guard exists to
-        // prevent. An empty batch is the easiest place to reintroduce it, because nothing was
-        // sent and the cursor moves anyway.
-        self.visible_head(scope).max(after)
-    }
+    // `head_for` used to live here: on an empty batch it advanced the cursor to the scope's
+    // visible head, so a device on a quiet scope would not re-ask the same empty range.
+    //
+    // Removed at CS-18, because the real `fill_batch` does not do that — it leaves `next_cursor`
+    // exactly where the client sent it when nothing was chosen. Keeping the model's version would
+    // have meant the simulator exercising a cursor rule that `credsyncd` does not implement, which
+    // is the whole failure mode running the real code is meant to remove. Re-asking a quiet scope
+    // costs one empty round trip, which is what polling is.
 
     /// Every row a client at `cursor` should be holding, with the version it should be at.
     ///
@@ -340,9 +405,31 @@ impl Server {
     /// Applies a push, deduping replays and recording every outcome.
     #[must_use]
     pub fn push(&mut self, request: &PushRequest, rng: &mut Rng) -> PushResponse {
+        self.push_prefix(request, request.commands.len(), rng)
+    }
+
+    /// Answers a push, processing only the first `accepted` commands.
+    ///
+    /// How a loaded server sheds without lying. The commands beyond `accepted` are **not answered
+    /// at all** — not rejected, not deferred with a status, simply absent from `results`. The
+    /// client's [`apply_results`] resolves only the ids it is told about, so the rest stay in the
+    /// outbox and come back on the next cycle.
+    ///
+    /// The alternative — answering `rejected` because the server was busy — would tell a student
+    /// their work was refused when nothing ever looked at it, and the dedupe table would serve
+    /// that back on every retry, permanently. Same rule as D-065, from the other side.
+    ///
+    /// [`apply_results`]: credsync_core::Engine::apply_results
+    pub fn push_prefix(
+        &mut self,
+        request: &PushRequest,
+        accepted: usize,
+        rng: &mut Rng,
+    ) -> PushResponse {
         let results = request
             .commands
             .iter()
+            .take(accepted)
             .map(|c| self.apply_command(c, rng))
             .collect();
 
@@ -355,33 +442,48 @@ impl Server {
     fn apply_command(&mut self, command: &Command, rng: &mut Rng) -> CommandResult {
         let checksum = payload_checksum(&command.payload).unwrap_or_else(|_| hex_placeholder());
 
-        if let Some(prior) = self.dedupe.get(&command.id) {
-            if prior.checksum == checksum {
-                // A replay of the same body. `docs/spec.md` §1: return the recorded outcome
-                // without re-applying.
-                return prior.result.clone();
+        // The REAL dedupe rule, not a model of it (CS-18).
+        //
+        // `credsync_server::decide` is the same function the Postgres server runs; only the
+        // lookup differs, because the database's job is to remember and the rule about what a
+        // memory *means* belongs in one place. A second implementation here would have agreed
+        // with it on the day it was written, which is exactly when a copy looks harmless.
+        let recorded = self
+            .dedupe
+            .get(&command.id)
+            .map(|prior| credsync_server::Recorded {
+                checksum: prior.checksum.as_str().to_owned(),
+                result: prior.result.clone(),
+            });
+
+        match credsync_server::decide(command, recorded.as_ref()) {
+            Ok(credsync_server::Decision::Replay(result)) => return result,
+            Ok(credsync_server::Decision::Mutated { .. }) => {
+                // Same id, different body. Refused as a distinct invalid request rather than
+                // deduped as a success, or the dedupe table becomes a way to launder tampered
+                // commands (`docs/spec.md` §5).
+                let result = CommandResult {
+                    id: command.id,
+                    status: Status::Rejected,
+                    reason: Some(credsync_server::dedupe::mutated_reason()),
+                    server_seq: None,
+                };
+                self.dedupe.insert(
+                    command.id,
+                    DedupeEntry {
+                        checksum,
+                        result: result.clone(),
+                    },
+                );
+                return result;
             }
-            // Same id, different body. Refused as a distinct invalid request rather than deduped
-            // as a success, or the dedupe table becomes a way to launder tampered commands.
-            let result = CommandResult {
-                id: command.id,
-                status: Status::Rejected,
-                reason: Some(
-                    credsync_protocol::Reason::new(
-                        "Command id replayed with a different payload checksum.",
-                    )
-                    .unwrap_or_else(|_| unreachable!("literal is a valid reason")),
-                ),
-                server_seq: None,
-            };
-            self.dedupe.insert(
-                command.id,
-                DedupeEntry {
-                    checksum,
-                    result: result.clone(),
-                },
-            );
-            return result;
+            Ok(credsync_server::Decision::Fresh) => {}
+            Err(_) => {
+                // Only when the payload cannot be encoded for checksumming, which cannot happen
+                // for a command built from validated wire types. Treated as fresh rather than
+                // panicking: a simulator that dies on an impossible branch tells you less than one
+                // that keeps running and lets an invariant catch the consequence.
+            }
         }
 
         let Some((entity, scope)) = self.command_targets.get(command.name.as_str()).cloned() else {

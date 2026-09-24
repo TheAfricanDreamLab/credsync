@@ -17,6 +17,13 @@ workspace = true
 # bytes run here and in production, so a bug this finds is a bug a device would have hit.
 credsync-core     = { path = "../credsync-core", version = "0.0.1" }
 credsync-protocol = { path = "../credsync-protocol", version = "0.0.1" }
+# The REAL server logic, with its database half switched off.
+#
+# `default-features = false` drops `tokio-postgres` and `tokio` from the graph, leaving the parts
+# that are pure functions over wire types: the compressed byte budget, the dedupe rule, the token
+# verifier. The simulator runs those rather than its own copies -- a simulator testing its own
+# reimplementation of the byte budget is testing the copy, not the code (CS-18).
+credsync-server   = { path = "../credsync-server", version = "0.0.1", default-features = false }
 
 # Host documents in simulated snapshots and payloads.
 serde_json = "1"
