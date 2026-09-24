@@ -60,6 +60,20 @@ pub enum Telemetry {
         reason: String,
     },
 
+    /// A scope diverged again after being rebuilt, repeatedly. Automatic healing has given up.
+    ///
+    /// Distinct from [`ScopeDiverged`](Self::ScopeDiverged) because it means something different
+    /// and needs a different response. One divergence is a fault the client can heal by itself; a
+    /// scope that diverges immediately after being rebuilt from the server's own snapshot is
+    /// systematically broken — in an adapter, a migration, or the server — and no amount of
+    /// re-downloading will fix it. This is the event that should reach a person.
+    ScopeUnhealable {
+        /// The scope that cannot be healed.
+        scope: ScopeId,
+        /// How many times it has diverged.
+        attempts: u32,
+    },
+
     /// The server refused this client's protocol version. `docs/spec.md` §7.
     ///
     /// Carries `queued` so the prompt can say what is at stake. "Please update to continue" is

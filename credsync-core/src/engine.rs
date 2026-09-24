@@ -13,7 +13,7 @@ use crate::effect::{Effect, Telemetry};
 use crate::migrate::{MigrationError, Migrations};
 use crate::outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
 use crate::registry::Registry;
-use crate::scope::ScopeState;
+use crate::scope::{ScopeHealth, ScopeState};
 use crate::storage::StorageOp;
 use crate::traits::{Clock, Compressor, Entropy, Storage, Transport};
 use core::fmt;
@@ -88,6 +88,11 @@ where
     registry: Registry,
     /// The host's registered up-migrations. `docs/spec.md` §7.
     migrations: Migrations,
+    /// Per-scope divergence state. `docs/spec.md` §5.
+    ///
+    /// Keyed by scope so a tainted scope cannot stop the others syncing, which the spec requires
+    /// directly: *"A tainted scope does not block others."*
+    health: BTreeMap<ScopeId, ScopeHealth>,
     /// Set when the server has refused this client's protocol version.
     ///
     /// While set, nothing is pushed: the server has already said it will not accept this version,
@@ -118,6 +123,7 @@ where
             registry: Registry::default(),
             migrations: Migrations::new(),
             upgrade_required: None,
+            health: BTreeMap::new(),
         }
     }
 
@@ -182,9 +188,20 @@ where
     /// change, or storage refuses the transaction. In every case **nothing is written and no
     /// state moves**.
     pub fn apply_batch(&mut self, batch: &Batch) -> Result<Applied, ApplyError> {
-        // A pull batch always compares digests: the client is walking the log and should agree
-        // with the server after every batch.
-        self.apply_changes(batch, true)
+        // Digests are compared only on the **last** batch of a walk.
+        //
+        // The server's `digest` covers the scope as it stands now, not as it stood at the batch's
+        // `next_cursor`. A client eight rows into a twenty-row backlog therefore computes a digest
+        // over eight rows and disagrees — correctly, and for a reason that has nothing to do with
+        // divergence. Comparing mid-walk reports a mismatch on every batch but the last.
+        //
+        // Before CS-22 that was noisy telemetry. With self-healing it is worse: each false
+        // mismatch taints the scope, triggers a re-bootstrap, and escalates a perfectly healthy
+        // scope to `Unhealable`. Found by the simulator doing an ordinary catch-up.
+        //
+        // This is the same rule `apply_bootstrap` already follows for its pages, arrived at from
+        // the other direction.
+        self.apply_changes(batch, !batch.has_more)
     }
 
     /// Applies one page of a bootstrap. `docs/spec.md` §3.1.
@@ -299,6 +316,25 @@ where
             digest: digest.to_hex(),
         });
 
+        // Divergence is known *before* the commit: the digest is fully computed above, and the
+        // server's is on the batch. So the record rides in the same transaction as the state it
+        // describes, rather than in a second write afterwards.
+        //
+        // That matters twice over. `docs/spec.md` §4 requires the cursor to commit with the rows it
+        // covers, and a second transaction would mean a process killed between them had advanced
+        // its cursor while forgetting that the scope is broken — carrying on against a base it had
+        // already decided not to trust. It also keeps one apply to one transaction, which the
+        // adapter tests assert directly.
+        let diverged = compare_digest && digest.to_hex() != batch.digest;
+        let escalated = diverged.then(|| {
+            let attempts = self.scope_health(&batch.scope).attempts().saturating_add(1);
+            ops.push(StorageOp::RecordDivergence {
+                scope: batch.scope.clone(),
+                attempts,
+            });
+            attempts
+        });
+
         let outcome = self.storage.transact(&ops)?;
         debug_assert_eq!(
             outcome.applied,
@@ -326,9 +362,24 @@ where
         // `docs/spec.md` §5: the client compares after apply. A mismatch is silent divergence —
         // both sides walked the same log and hold different rows. Marking the scope tainted and
         // re-bootstrapping is CS-22 (#23); detecting and reporting it is this slice.
-        let diverged = compare_digest && digest.to_hex() != batch.digest;
-        if diverged {
+        if let Some(attempts) = escalated {
             self.emit(Effect::Emit(apply::divergence(batch, &digest)));
+            self.taint(&batch.scope, attempts);
+        } else if compare_digest {
+            // The scope agrees again, so it no longer needs rebuilding — but the *count* stays.
+            // A scope that diverges, heals, and diverges again is the repeated divergence the
+            // escalation exists for, and forgetting on each apparent success would let that run
+            // for ever. `clear_scope_health` is how a host that has investigated forgets it.
+            if let Some(health) = self.health.get(&batch.scope).copied()
+                && health.needs_rebootstrap()
+            {
+                self.health.insert(
+                    batch.scope.clone(),
+                    ScopeHealth::Healed {
+                        attempts: health.attempts(),
+                    },
+                );
+            }
         }
 
         Ok(Applied {
@@ -376,6 +427,134 @@ where
             schema_version: target,
             ..change.clone()
         }))
+    }
+
+    /// How much this client trusts its copy of a scope. `docs/spec.md` §5.
+    #[must_use]
+    pub fn scope_health(&self, scope: &ScopeId) -> ScopeHealth {
+        self.health
+            .get(scope)
+            .copied()
+            .unwrap_or(ScopeHealth::Healthy)
+    }
+
+    /// Every scope waiting to be re-bootstrapped, in name order.
+    ///
+    /// The sync loop asks this rather than being told, so a tainted scope is picked up after a
+    /// restart as readily as in the session that tainted it.
+    #[must_use]
+    pub fn scopes_needing_rebootstrap(&self) -> Vec<ScopeId> {
+        self.health
+            .iter()
+            .filter(|(_, h)| h.needs_rebootstrap())
+            .map(|(scope, _)| scope.clone())
+            .collect()
+    }
+
+    /// After how many divergences automatic healing gives up.
+    ///
+    /// Three is a judgement, not a measurement: one is a transient fault worth retrying, two is
+    /// bad luck, and a third immediately after rebuilding from the server's own snapshot means
+    /// something is systematically wrong. Continuing past that would have a device re-downloading
+    /// the same scope forever on a data budget it is paying for.
+    pub const MAX_HEAL_ATTEMPTS: u32 = 3;
+
+    /// Records a divergence, escalating once healing has been tried enough times.
+    /// Records a divergence in memory, after the transaction carrying it has committed.
+    ///
+    /// `attempts` is passed in rather than recomputed: it was already decided before the commit,
+    /// where it had to be, so that the durable count and the in-memory one can never disagree.
+    fn taint(&mut self, scope: &ScopeId, attempts: u32) {
+        let health = if attempts >= Self::MAX_HEAL_ATTEMPTS {
+            self.emit(Effect::Emit(Telemetry::ScopeUnhealable {
+                scope: scope.clone(),
+                attempts,
+            }));
+            ScopeHealth::Unhealable { attempts }
+        } else {
+            ScopeHealth::Tainted { attempts }
+        };
+        self.health.insert(scope.clone(), health);
+    }
+
+    /// Clears a scope's rows and resets its cursor, ready for a fresh bootstrap.
+    ///
+    /// # Why the rows go first
+    ///
+    /// A fresh bootstrap (`after = 0`) carries no tombstones, because a device starting from
+    /// nothing has no row to delete (`docs/spec.md` §3.1). So a row this client holds that the
+    /// server no longer has would survive a rebuild that did not clear first — and keep the digest
+    /// wrong forever, which is the condition being healed.
+    ///
+    /// The **outbox is untouched**. Those commands have not reached the server yet, and discarding
+    /// them to fix a read-side problem would be the cure doing more damage than the disease. They
+    /// are replayed after the rebuild, and the server's dedupe table is what stops any that did
+    /// arrive from applying twice.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError::Storage`] if the transaction fails. Nothing moves in that case, so
+    /// the scope stays tainted and the rebuild is simply retried.
+    pub fn begin_rebootstrap(&mut self, scope: &ScopeId) -> Result<(), ApplyError> {
+        let ops = vec![
+            StorageOp::ClearScope {
+                scope: scope.clone(),
+                entities: self
+                    .registry
+                    .entities()
+                    .filter(|r| &r.scope == scope)
+                    .map(|r| r.entity.clone())
+                    .collect(),
+            },
+            StorageOp::SetCursor {
+                scope: scope.clone(),
+                cursor: credsync_protocol::Cursor::START,
+            },
+            StorageOp::SetScopeDigest {
+                scope: scope.clone(),
+                digest: credsync_protocol::ScopeDigest::EMPTY.to_hex(),
+            },
+        ];
+        self.storage.transact(&ops)?;
+
+        // Only after the commit. A reset held in memory over a transaction that failed would have
+        // the engine re-bootstrapping onto rows it believes are gone.
+        self.scopes.insert(scope.clone(), ScopeState::NEW);
+        Ok(())
+    }
+
+    /// Forgets a scope's divergence history, after somebody has looked at it.
+    ///
+    /// The count is never cleared automatically, not even by a rebuild that agrees: a scope that
+    /// diverges, heals, and diverges again is exactly the repeated divergence the escalation is
+    /// for, and resetting on each apparent success would let that run for ever. Clearing is a
+    /// deliberate act by a host that has investigated.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError::Storage`] if the write fails; the count is then unchanged.
+    pub fn clear_scope_health(&mut self, scope: &ScopeId) -> Result<(), ApplyError> {
+        self.storage.transact(&[StorageOp::RecordDivergence {
+            scope: scope.clone(),
+            attempts: 0,
+        }])?;
+        self.health.remove(scope);
+        Ok(())
+    }
+
+    /// Restores a scope's divergence history from storage, at start-up.
+    ///
+    /// Without this the escalation counts only the divergences seen since
+    /// the process started, and a crash-looping device would rebuild the same scope forever.
+    pub fn restore_scope_health(&mut self, scope: ScopeId, attempts: u32) {
+        if attempts == 0 {
+            self.health.remove(&scope);
+            return;
+        }
+        let health = if attempts >= Self::MAX_HEAL_ATTEMPTS {
+            ScopeHealth::Unhealable { attempts }
+        } else {
+            ScopeHealth::Tainted { attempts }
+        };
+        self.health.insert(scope, health);
     }
 
     /// Records that the server refused this client's protocol version. `docs/spec.md` §7.

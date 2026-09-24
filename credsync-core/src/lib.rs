@@ -77,7 +77,7 @@ pub use event::Event;
 pub use migrate::{MigrationError, MigrationFn, Migrations};
 pub use outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
 pub use registry::{Registry, RegistryError};
-pub use scope::ScopeState;
+pub use scope::{ScopeHealth, ScopeState};
 pub use storage::{StorageOp, TxOutcome};
 pub use traits::{Clock, Compressor, Entropy, Storage, Transport};
 pub use types::{RequestId, Timestamp};
