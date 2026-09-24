@@ -17,8 +17,8 @@ use crate::storage::StorageOp;
 use crate::traits::{Clock, Compressor, Entropy, Storage, Transport};
 use core::fmt;
 use credsync_protocol::{
-    Batch, Command, CommandId, ConflictClass, ProtocolVersion, PushRequest, PushResponse, Reason,
-    ScopeId, Status, canonical, limits,
+    Batch, BootstrapResponse, Command, CommandId, ConflictClass, ProtocolVersion, PushRequest,
+    PushResponse, Reason, ScopeId, Status, canonical, limits,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -156,6 +156,51 @@ where
     /// change, or storage refuses the transaction. In every case **nothing is written and no
     /// state moves**.
     pub fn apply_batch(&mut self, batch: &Batch) -> Result<Applied, ApplyError> {
+        // A pull batch always compares digests: the client is walking the log and should agree
+        // with the server after every batch.
+        self.apply_changes(batch, true)
+    }
+
+    /// Applies one page of a bootstrap. `docs/spec.md` §3.1.
+    ///
+    /// Bootstrap is the compacted log, so this is the same work as [`apply_batch`](Self::apply_batch)
+    /// — same ordering rules, same staging, same single transaction, same cursor-with-rows
+    /// guarantee. It is a separate method for exactly one reason.
+    ///
+    /// # Divergence is not judged until the last page
+    ///
+    /// The `digest` on a bootstrap response is the server's digest for the **whole scope**. A
+    /// client that has applied page one of four holds a quarter of the rows and will not match it,
+    /// and that is not divergence — it is a bootstrap in progress.
+    ///
+    /// Comparing on every page would report divergence on every partial bootstrap, and a detector
+    /// that fires constantly during normal operation is a detector somebody switches off. So the
+    /// comparison happens only when `has_more` is false.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError`] if the page breaks an ordering rule, carries an inconsistent change,
+    /// or storage refuses the transaction. Nothing is written and no state moves.
+    pub fn apply_bootstrap(&mut self, response: &BootstrapResponse) -> Result<Applied, ApplyError> {
+        let batch = Batch {
+            scope: response.scope.clone(),
+            changes: response.changes.clone(),
+            next_cursor: response.next_cursor,
+            has_more: response.has_more,
+            checksum: response.checksum.clone(),
+            digest: response.digest.clone(),
+        };
+        self.apply_changes(&batch, !response.has_more)
+    }
+
+    /// The shared body of [`apply_batch`](Self::apply_batch) and
+    /// [`apply_bootstrap`](Self::apply_bootstrap).
+    ///
+    /// `compare_digest` is false only for a bootstrap page that is not the last one.
+    fn apply_changes(
+        &mut self,
+        batch: &Batch,
+        compare_digest: bool,
+    ) -> Result<Applied, ApplyError> {
         let state = self.scopes.get(&batch.scope).copied().unwrap_or_default();
 
         apply::validate_ordering(batch, state.cursor.get())?;
@@ -208,7 +253,7 @@ where
         // `docs/spec.md` §5: the client compares after apply. A mismatch is silent divergence —
         // both sides walked the same log and hold different rows. Marking the scope tainted and
         // re-bootstrapping is CS-22 (#23); detecting and reporting it is this slice.
-        let diverged = digest.to_hex() != batch.digest;
+        let diverged = compare_digest && digest.to_hex() != batch.digest;
         if diverged {
             self.emit(Effect::Emit(apply::divergence(batch, &digest)));
         }

@@ -348,3 +348,95 @@ pub async fn append_change(client: &Client, change: &NewChange<'_>) -> Result<i6
         .await?;
     Ok(row.get(0))
 }
+
+/// Reads one page of a scope's **compacted** log, for bootstrap. `docs/spec.md` §3.1.
+///
+/// # Compaction is the whole point
+///
+/// Ordinary pull replays every change. A device joining a year-old scope does not need a year of
+/// edits — it needs the current value of each row, once. So this returns, per `(entity, entity_id)`,
+/// that row's single latest change, ordered by that change's `seq`.
+///
+/// Because the ordering key *is* a log `seq`, `after` and the resulting `next_cursor` are the same
+/// currency as pull's. One `u64` resumes a partial bootstrap, and the device joins the log exactly
+/// where the bootstrap left off.
+///
+/// # Tombstones, and the bug that made them necessary
+///
+/// A row whose latest change is a delete is included when `after > 0` and skipped when `after = 0`.
+///
+/// The asymmetry is not an optimisation. Consider a row delivered on page one and deleted while
+/// page two is being computed. If bootstrap returned only *live* rows it would never resend that
+/// row — it is not live any more — and its tombstone sits below the `next_cursor` the device joins
+/// at, so the log would never deliver it either. The device would hold a deleted row permanently.
+///
+/// When `after = 0` the device holds nothing, so there is no row to correct and a historical
+/// tombstone would be pure noise.
+///
+/// # The same visibility guard as pull
+///
+/// The `xmin` guard from [`changes_after`] applies here for the same reason: a row whose inserting
+/// transaction may still be in flight must not set `next_cursor` past a change the device will
+/// never be given. See #62 for the guard's cost.
+///
+/// # Errors
+/// Returns [`ServerError::Database`] on a query failure, or [`ServerError::Corrupt`] if a stored
+/// row fails the protocol's validation on the way out.
+pub async fn bootstrap_after(
+    client: &Client,
+    scope: &ScopeId,
+    after: u64,
+    limit: i64,
+) -> Result<Page, ServerError> {
+    let after_i = i64::try_from(after).map_err(|_| ServerError::Corrupt {
+        detail: format!("bootstrap cursor {after} does not fit a bigint"),
+    })?;
+
+    // `DISTINCT ON` takes the highest-seq row per entity pair, then the outer query orders that
+    // compacted set by seq and pages it. Written this way rather than with a window function
+    // because `DISTINCT ON` is the one Postgres does with a single index scan.
+    let rows = client
+        .query(
+            "SELECT seq, entity, entity_id, op, snapshot, row_version, schema_version
+               FROM (
+                 SELECT DISTINCT ON (entity, entity_id)
+                        seq, entity, entity_id, op, snapshot, row_version, schema_version
+                   FROM sync_changes
+                  WHERE scope = $1
+                    AND xmin::text::bigint
+                        < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+                  ORDER BY entity, entity_id, seq DESC
+               ) AS latest
+              WHERE seq > $2
+                AND (op <> 'delete' OR $2 > 0)
+              ORDER BY seq ASC
+              LIMIT $3",
+            &[&scope.as_str(), &after_i, &(limit + 1)],
+        )
+        .await?;
+
+    let more_beyond = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+    let changes = rows
+        .into_iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .map(|r| {
+            Ok(ChangeRow {
+                seq: r.try_get(0)?,
+                entity: r.try_get(1)?,
+                entity_id: r.try_get(2)?,
+                op: r.try_get(3)?,
+                snapshot: r.try_get(4)?,
+                row_version: r.try_get(5)?,
+                schema_version: r.try_get(6)?,
+            })
+        })
+        .collect::<Result<Vec<ChangeRow>, ServerError>>()?
+        .into_iter()
+        .map(ChangeRow::into_change)
+        .collect::<Result<Vec<Change>, ServerError>>()?;
+
+    Ok(Page {
+        changes,
+        more_beyond,
+    })
+}

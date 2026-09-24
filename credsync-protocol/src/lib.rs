@@ -46,9 +46,9 @@ pub use integrity::{
 };
 pub use nums::{Cursor, LimitBytes, ProtocolVersion, RowVersion, SchemaVersion, Seq};
 pub use wire::{
-    Batch, BootstrapRequest, BootstrapResponse, BootstrapRow, Change, Command, CommandResult,
-    ConflictClass, Document, EntityRegistration, ForcedUpgrade, Op, Payload, PullRequest,
-    PullResponse, PushRequest, PushResponse, ScopeCursor, Snapshot, Status,
+    Batch, BootstrapRequest, BootstrapResponse, Change, Command, CommandResult, ConflictClass,
+    Document, EntityRegistration, ForcedUpgrade, Op, Payload, PullRequest, PullResponse,
+    PushRequest, PushResponse, ScopeCursor, Snapshot, Status,
 };
 
 /// The protocol version this crate implements.

@@ -9,7 +9,7 @@
 #![allow(dead_code, unreachable_pub)]
 
 use credsync_protocol::{
-    Batch, BootstrapResponse, BootstrapRow, Change, Command, CommandId, CommandName, CommandResult,
+    Batch, BootstrapResponse, Change, Command, CommandId, CommandName, CommandResult,
     ConflictClass, Cursor, EntityId, EntityName, EntityRegistration, ForcedUpgrade, HexString,
     LimitBytes, Op, Payload, ProtocolVersion, PullRequest, PullResponse, PushRequest, PushResponse,
     Reason, RowVersion, SchemaVersion, ScopeCursor, ScopeId, Seq, Snapshot, Status, limits,
@@ -251,44 +251,27 @@ pub fn push_response() -> impl Strategy<Value = PushResponse> {
         .prop_map(|(protocol, results)| PushResponse { protocol, results })
 }
 
-pub fn bootstrap_row() -> impl Strategy<Value = BootstrapRow> {
-    (
-        entity_name(),
-        entity_id(),
-        snapshot(),
-        row_version(),
-        schema_version(),
-    )
-        .prop_map(
-            |(entity, entity_id, snapshot, row_version, schema_version)| BootstrapRow {
-                entity,
-                entity_id,
-                snapshot,
-                row_version,
-                schema_version,
-            },
-        )
-}
-
 pub fn bootstrap_response() -> impl Strategy<Value = BootstrapResponse> {
     (
         protocol_version(),
         scope_id(),
-        proptest::collection::vec(bootstrap_row(), 0..3),
+        proptest::collection::vec(change(), 0..3),
         cursor(),
         any::<bool>(),
         hex(),
         hex(),
     )
         .prop_map(
-            |(protocol, scope, rows, next_cursor, has_more, checksum, digest)| BootstrapResponse {
-                protocol,
-                scope,
-                rows,
-                next_cursor,
-                has_more,
-                checksum,
-                digest,
+            |(protocol, scope, changes, next_cursor, has_more, checksum, digest)| {
+                BootstrapResponse {
+                    protocol,
+                    scope,
+                    changes,
+                    next_cursor,
+                    has_more,
+                    checksum,
+                    digest,
+                }
             },
         )
 }

@@ -59,7 +59,6 @@ roundtrip_test!(pull_request_roundtrips, common::pull_request());
 roundtrip_test!(pull_response_roundtrips, common::pull_response());
 roundtrip_test!(push_request_roundtrips, common::push_request());
 roundtrip_test!(push_response_roundtrips, common::push_response());
-roundtrip_test!(bootstrap_row_roundtrips, common::bootstrap_row());
 roundtrip_test!(bootstrap_response_roundtrips, common::bootstrap_response());
 roundtrip_test!(
     entity_registration_roundtrips,
