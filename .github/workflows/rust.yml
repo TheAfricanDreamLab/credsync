@@ -47,6 +47,28 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # A second, isolated cluster for the migration tests (#63), which hold write transactions
+      # open for tens of seconds on purpose.
+      #
+      # `changes_after` withholds rows whose inserting transaction may still be in flight (D-063)
+      # and decides that from `pg_snapshot_xmin` -- the oldest transaction running anywhere in the
+      # *cluster*, since transaction ids are cluster-wide. Measured at CS-17: a transaction held in
+      # an unrelated database still made a committed row read back as 0 of 1. So a second database
+      # would isolate nothing and a second cluster does. The liveness problem itself is #62.
+      postgres-isolated:
+        image: postgres:16
+        env:
+          POSTGRES_USER: credsync
+          POSTGRES_PASSWORD: credsync
+          POSTGRES_DB: credsync_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +98,7 @@ jobs:
           # The integration tests fail loudly when this is absent rather than skipping. A suite
           # that goes green on a machine that never ran it is worse than no suite.
           CREDSYNC_TEST_DATABASE_URL: postgres://credsync:credsync@localhost:5432/credsync_test
+          CREDSYNC_TEST_ISOLATED_DATABASE_URL: postgres://credsync:credsync@localhost:5433/credsync_test
         run: cargo test --workspace --all-features
 
       - name: cargo doc

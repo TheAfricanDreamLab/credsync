@@ -272,16 +272,26 @@ async fn concurrent_submissions_of_one_id_apply_exactly_once() {
     let test = "concurrent_once";
     let scope = unique_scope(test);
     let cmd = command(test, 1, "body");
-    let seq = u64::try_from(a_change(&client, &scope).await).expect("positive");
+    // Two real changes, and their *actual* seqs.
+    //
+    // An earlier version wrote one change and used `seq` and `seq + 1`, which assumed the next
+    // number was also a row. `seq` is a `bigserial` shared by every scope and every concurrently
+    // running test, so `seq + 1` belonged to whichever test happened to insert next -- or to
+    // nothing at all, and then the foreign key on `server_seq` refused the write. The test passed
+    // only while some other test was busy, which is not a property worth depending on.
+    let seq_a = u64::try_from(a_change(&client, &scope).await).expect("positive");
+    let seq_b = u64::try_from(a_change(&client, &scope).await).expect("positive");
+    let seqs = [seq_a, seq_b];
 
     // Eight independent sessions, each recording a *different* server_seq, all at once. Only one
     // can win, and everyone must be told the same thing afterwards.
     let mut handles = Vec::new();
-    for n in 0..8u64 {
+    for n in 0..8usize {
         let cmd = cmd.clone();
+        let seq = seqs[n % 2];
         handles.push(tokio::spawn(async move {
             let client = connect().await;
-            let outcome = applied(cmd.id, seq + n % 2);
+            let outcome = applied(cmd.id, seq);
             dedupe::record(&client, &cmd, &outcome).await
         }));
     }

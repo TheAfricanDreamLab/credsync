@@ -13,16 +13,20 @@
 //! # Status
 //!
 //! Scaffolded at CS-1. Schema and pagination arrive at CS-14, dedupe at CS-15, host forwarding
-//! at CS-16.
+//! at CS-16, scope-token validation and the blocklist at CS-17.
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
+pub mod blocklist;
 pub mod db;
 pub mod dedupe;
 pub mod error;
 pub mod host;
 pub mod pull;
 
+pub use auth::{AuthError, Claims, Verifier};
+pub use blocklist::Standing;
 pub use db::NewChange;
 pub use dedupe::{Decision, DedupeStats};
 pub use error::ServerError;
