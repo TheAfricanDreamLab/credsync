@@ -117,6 +117,18 @@ cargo deny check licenses
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
+**`cargo test --workspace` needs a Postgres from CS-14 onward.** The server's integration tests run
+against a real database and **fail loudly when one is absent** rather than skipping — a suite that
+goes green on a machine which never ran it is worse than no suite. One command satisfies it:
+
+```sh
+eval "$(./scripts/test-postgres.sh)"     # throwaway cluster on 55432, exports the URL
+./scripts/test-postgres.sh --stop        # when you are done
+```
+
+It touches nothing else: not your own Postgres, not port 5432, not your data directory. CI uses a
+`services: postgres` container instead.
+
 **`RUSTDOCFLAGS`, not `RUSTFLAGS`.** Cargo forwards `RUSTFLAGS` to rustc and *not* to rustdoc, so
 `-D warnings` alone leaves every rustdoc lint — broken intra-doc links included — a warning that
 exits 0. CI carried a `cargo doc` step from CS-1 that had never once failed a build, and a broken

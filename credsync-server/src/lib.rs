@@ -16,3 +16,11 @@
 //! at CS-16.
 
 #![forbid(unsafe_code)]
+
+pub mod db;
+pub mod error;
+pub mod pull;
+
+pub use db::NewChange;
+pub use error::ServerError;
+pub use pull::{ChangeRow, Compressor, DEFAULT_BUDGET_BYTES, fill_batch};
