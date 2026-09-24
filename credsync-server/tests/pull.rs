@@ -44,6 +44,19 @@ impl Compressor for Ratio {
 /// Instead each test owns a unique scope. That is also closer to the real deployment — one shared
 /// `bigserial` log holding many tenants' changes interleaved — so the isolation the scope filter
 /// provides is exercised by every test rather than only the one that names it.
+/// A connection with nothing done to it. A distinct session, which is what makes the
+/// commit-order test mean anything: two sessions, two transactions, one in flight.
+async fn connect() -> Client {
+    let url = std::env::var("CREDSYNC_TEST_DATABASE_URL").expect("CREDSYNC_TEST_DATABASE_URL");
+    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+        .await
+        .expect("connects to the test database");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
 async fn fresh() -> Client {
     let url = std::env::var("CREDSYNC_TEST_DATABASE_URL").unwrap_or_else(|_| {
         panic!(
@@ -79,7 +92,19 @@ async fn fresh() -> Client {
 ///
 /// The test name is in there so a failure message names the test that produced the scope.
 fn unique_scope(test: &str) -> String {
-    format!("inst:{test}:{}", std::process::id())
+    use std::sync::OnceLock;
+    static RUN: OnceLock<u128> = OnceLock::new();
+
+    // Not the process id alone. Operating systems reuse pids, and the test cluster is long-lived
+    // (D-059), so a later run can be handed an earlier run's pid and then read its rows — the
+    // count assertions would fail intermittently, which is the worst kind of failure to debug.
+    // Nanoseconds since the epoch do not repeat between runs on any machine this will run on.
+    let run = RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    });
+    format!("inst:{test}:{run}")
 }
 
 fn scope(s: &str) -> ScopeId {
@@ -124,7 +149,8 @@ async fn pull_is_strictly_seq_ordered_within_a_scope() {
 
     let changes = db::changes_after(&client, &scope(&sc), 0, 100)
         .await
-        .expect("reads");
+        .expect("reads")
+        .changes;
 
     assert_eq!(changes.len(), 12);
     let seqs: Vec<u64> = changes.iter().map(|c| c.seq.get()).collect();
@@ -151,7 +177,8 @@ async fn a_cursor_walks_forward_without_repeating() {
     for _ in 0..10 {
         let changes = db::changes_after(&client, &scope(&sc), cursor, 3)
             .await
-            .expect("reads");
+            .expect("reads")
+            .changes;
         if changes.is_empty() {
             break;
         }
@@ -179,37 +206,63 @@ async fn a_cursor_walks_forward_without_repeating() {
 /// Pull cannot cross scopes, whatever cursor the client sends.
 ///
 /// The client controls `cursor` completely and can send any value it likes. What it cannot do is
-/// reach another scope's rows, because the query never looks at them. Tested with a cursor of
-/// zero — the most permissive value there is — while a second scope holds changes on both sides
-/// of it.
+/// reach another scope's rows, because the query never looks at them.
+///
+/// The cursors are taken from the **actual** seqs allocated, not written as literals. An earlier
+/// version used `0, 1, 5, 11`, and since `seq` is shared by every scope, every concurrent test and
+/// every earlier run, those were all far below every row this test wrote — so each query returned
+/// all of scope A and no cursor ever landed between B's rows. The test could not have failed for
+/// the reason its own comment gave.
 #[tokio::test]
 async fn pull_cannot_cross_scopes_whatever_the_cursor() {
     let client = fresh().await;
     let a = unique_scope("cross_a");
     let b = unique_scope("cross_b");
 
-    // Interleaved, so the two scopes' seqs are genuinely mixed in one shared bigserial.
+    // Interleaved, so the two scopes' seqs genuinely alternate in one shared bigserial.
+    let mut a_seqs = Vec::new();
+    let mut b_seqs = Vec::new();
     for n in 0..6 {
-        append(&client, &a, &format!("a{n}"), 16, 1).await;
-        append(&client, &b, &format!("b{n}"), 16, 1).await;
+        a_seqs.push(append(&client, &a, &format!("a{n}"), 16, 1).await);
+        b_seqs.push(append(&client, &b, &format!("b{n}"), 16, 1).await);
     }
 
-    for cursor in [0u64, 1, 5, 11] {
+    // Cursors that really do fall before, between and after scope B's rows.
+    let cursors = [
+        0u64,
+        u64::try_from(a_seqs[0] - 1).expect("positive"),
+        u64::try_from(b_seqs[0]).expect("positive"),
+        u64::try_from(b_seqs[2]).expect("positive"),
+        u64::try_from(*b_seqs.last().expect("six rows")).expect("positive"),
+    ];
+
+    for cursor in cursors {
         let changes = db::changes_after(&client, &scope(&a), cursor, 100)
             .await
-            .expect("reads");
-        assert!(
-            !changes.is_empty() || cursor >= 11,
-            "cursor {cursor} returned nothing for a scope that has changes"
-        );
+            .expect("reads")
+            .changes;
+
         for c in &changes {
             assert!(
                 c.entity_id.as_str().starts_with('a'),
                 "cursor {cursor} leaked a row from another scope: {}",
                 c.entity_id
             );
+            assert!(
+                !b_seqs.contains(&i64::try_from(c.seq.get()).expect("fits")),
+                "cursor {cursor} returned a seq that belongs to scope B"
+            );
         }
     }
+
+    // And the middle cursor really does sit between B's rows, or the test proves less than it says.
+    let middle = u64::try_from(b_seqs[2]).expect("positive");
+    assert!(
+        b_seqs
+            .iter()
+            .any(|s| u64::try_from(*s).expect("fits") > middle),
+        "the chosen cursor was not actually between scope B's rows"
+    );
 }
 
 /// An unknown scope returns nothing rather than everything.
@@ -225,7 +278,8 @@ async fn an_unknown_scope_returns_nothing() {
 
     let changes = db::changes_after(&client, &scope("inst:nobody-at-all"), 0, 100)
         .await
-        .expect("reads");
+        .expect("reads")
+        .changes;
     assert!(
         changes.is_empty(),
         "an unknown scope saw {} rows",
@@ -248,13 +302,15 @@ async fn batches_are_capped_by_compressed_bytes_not_row_count() {
 
     let candidates = db::changes_after(&client, &scope(&sc), 0, 100)
         .await
-        .expect("reads");
+        .expect("reads")
+        .changes;
     assert_eq!(candidates.len(), 40);
 
     let batch = fill_batch(
         &scope(&sc),
         Cursor::START,
         candidates,
+        false,
         2_000,
         &Ratio(1),
         digest(),
@@ -287,12 +343,14 @@ async fn a_better_compression_ratio_fits_more_changes() {
     }
     let candidates = db::changes_after(&client, &scope(&sc), 0, 100)
         .await
-        .expect("reads");
+        .expect("reads")
+        .changes;
 
     let lean = fill_batch(
         &scope(&sc),
         Cursor::START,
         candidates.clone(),
+        false,
         2_000,
         &Ratio(1),
         digest(),
@@ -302,6 +360,7 @@ async fn a_better_compression_ratio_fits_more_changes() {
         &scope(&sc),
         Cursor::START,
         candidates,
+        false,
         2_000,
         &Ratio(8),
         digest(),
@@ -331,12 +390,14 @@ async fn one_oversized_change_is_delivered_alone_rather_than_stalling_the_cursor
 
     let candidates = db::changes_after(&client, &scope(&sc), 0, 100)
         .await
-        .expect("reads");
+        .expect("reads")
+        .changes;
 
     let batch = fill_batch(
         &scope(&sc),
         Cursor::START,
         candidates,
+        false,
         100,
         &Ratio(1),
         digest(),
@@ -368,12 +429,21 @@ async fn the_walk_continues_past_an_oversized_change() {
     for _ in 0..5 {
         let candidates = db::changes_after(&client, &scope(&sc), cursor.get(), 100)
             .await
-            .expect("reads");
+            .expect("reads")
+            .changes;
         if candidates.is_empty() {
             break;
         }
-        let batch =
-            fill_batch(&scope(&sc), cursor, candidates, 100, &Ratio(1), digest()).expect("fills");
+        let batch = fill_batch(
+            &scope(&sc),
+            cursor,
+            candidates,
+            false,
+            100,
+            &Ratio(1),
+            digest(),
+        )
+        .expect("fills");
         assert!(
             !batch.changes.is_empty(),
             "a cycle delivered nothing; the cursor is stuck at {}",
@@ -397,12 +467,14 @@ async fn an_empty_scope_produces_an_empty_batch() {
     let client = fresh().await;
     let candidates = db::changes_after(&client, &scope(&unique_scope("empty_scope")), 0, 100)
         .await
-        .expect("reads");
+        .expect("reads")
+        .changes;
 
     let batch = fill_batch(
         &scope(&unique_scope("empty_scope")),
         Cursor::START,
         candidates,
+        false,
         10_000,
         &Ratio(1),
         digest(),
@@ -488,12 +560,142 @@ async fn a_tombstone_round_trips_without_a_snapshot() {
 
     let changes = db::changes_after(&client, &scope(&sc), 0, 10)
         .await
-        .expect("reads");
+        .expect("reads")
+        .changes;
 
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].op, credsync_protocol::Op::Delete);
     assert!(
         changes[0].snapshot.is_none(),
         "a tombstone carried a snapshot"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// The commit-order gap
+// -------------------------------------------------------------------------------------------
+
+/// A change committed *after* a higher `seq` is never skipped.
+///
+/// `seq` is a `bigserial`, which allocates when the `INSERT` runs — but a row becomes visible when
+/// its transaction commits, and those orders differ. Demonstrated against Postgres 14 before this
+/// guard existed:
+///
+/// ```text
+///   A: BEGIN; INSERT -> seq 1; (still open)
+///   B:        INSERT -> seq 2; COMMIT
+///   reader sees: seq 2 only
+/// ```
+///
+/// A client would take `seq 2`, advance its cursor past `1`, and never be given change 1 — silent
+/// loss, invisible to every ordering check because the batch it received was perfectly ordered.
+///
+/// Found by review on #59. The simulator could not have caught it: its server is single-threaded,
+/// so no two writes are ever in flight at once.
+#[tokio::test]
+async fn a_change_committed_after_a_higher_seq_is_not_skipped() {
+    let sc = unique_scope("commit_order_gap");
+    let reader = fresh().await;
+
+    // A writer that takes a seq and holds its transaction open.
+    let slow = connect().await;
+    slow.batch_execute("BEGIN").await.expect("begins");
+    let snapshot = serde_json::json!({ "body": "written first, committed last" });
+    db::append_change(
+        &slow,
+        &db::NewChange {
+            scope: &sc,
+            entity: "reflections",
+            entity_id: "slow",
+            op: "upsert",
+            snapshot: Some(&snapshot),
+            row_version: 1,
+            schema_version: 1,
+        },
+    )
+    .await
+    .expect("appends inside the open transaction");
+
+    // A second writer takes a higher seq and commits immediately.
+    append(&reader, &sc, "fast", 16, 1).await;
+
+    // While the first transaction is still open, the reader must be given NOTHING — withholding
+    // the later change rather than delivering it out of order.
+    let during = db::changes_after(&reader, &scope(&sc), 0, 100)
+        .await
+        .expect("reads")
+        .changes;
+    assert!(
+        during.is_empty(),
+        "the reader was handed {} change(s) while an earlier seq was still uncommitted; \
+         advancing the cursor past them loses the earlier one forever",
+        during.len()
+    );
+
+    slow.batch_execute("COMMIT").await.expect("commits");
+
+    // Once it commits, both arrive, in seq order.
+    let after = db::changes_after(&reader, &scope(&sc), 0, 100)
+        .await
+        .expect("reads")
+        .changes;
+    assert_eq!(
+        after.len(),
+        2,
+        "both changes must arrive once the writer commits"
+    );
+    assert!(
+        after[0].seq.get() < after[1].seq.get(),
+        "the pair arrived out of seq order"
+    );
+    assert_eq!(
+        after[0].entity_id.as_str(),
+        "slow",
+        "the earlier seq must come first"
+    );
+}
+
+/// The row ceiling sets `has_more`, even when every row fits the byte budget.
+///
+/// `fill_batch` cannot tell from its side whether the read was truncated: a hundred small
+/// tombstones fit a 100 KB budget easily, so every candidate is chosen and `has_more` would read
+/// `false` while rows remain. The scope would then sit still until something else happened to it.
+#[tokio::test]
+async fn the_row_ceiling_sets_has_more_even_when_everything_fits_the_budget() {
+    let client = fresh().await;
+    let sc = unique_scope("row_ceiling");
+    for n in 0..12 {
+        append(&client, &sc, &format!("r{n}"), 8, 1).await;
+    }
+
+    let page = db::changes_after(&client, &scope(&sc), 0, 4)
+        .await
+        .expect("reads");
+    assert_eq!(
+        page.changes.len(),
+        4,
+        "the ceiling should cap the read at 4"
+    );
+    assert!(page.more_beyond, "eight rows remain beyond the ceiling");
+
+    let batch = fill_batch(
+        &scope(&sc),
+        Cursor::START,
+        page.changes,
+        page.more_beyond,
+        10_000_000,
+        &Ratio(1),
+        digest(),
+    )
+    .expect("fills");
+
+    assert_eq!(
+        batch.changes.len(),
+        4,
+        "the budget did not bind; the ceiling did"
+    );
+    assert!(
+        batch.has_more,
+        "has_more must be true when the ROW ceiling truncated, not only when the budget did"
     );
 }

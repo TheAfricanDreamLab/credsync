@@ -137,6 +137,7 @@ pub fn fill_batch<C: Compressor>(
     scope: &ScopeId,
     cursor: Cursor,
     candidates: Vec<Change>,
+    more_beyond: bool,
     budget_bytes: usize,
     compressor: &C,
     digest: HexString,
@@ -189,10 +190,12 @@ pub fn fill_batch<C: Compressor>(
         // changes would skip them silently; leaving it short would re-deliver what was just
         // applied, which the client refuses — wedging the scope one round trip at a time.
         next_cursor,
-        // True when anything was left behind, which is what drives continuation. The caller
-        // fetches more candidates than one batch can hold precisely so this can be known without
-        // a second query.
-        has_more: chosen.len() < available,
+        // True when anything was left behind — by the byte budget here, or by the row ceiling in
+        // the query that produced these candidates. Both can truncate, and only the caller knows
+        // about the second: a hundred small tombstones fit a 100 KB budget easily, so every
+        // candidate would be chosen and `has_more` would read `false` while rows remain, leaving
+        // the scope sitting still until something else happened to it.
+        has_more: chosen.len() < available || more_beyond,
         checksum: batch_checksum(&chosen)?,
         digest,
         changes: chosen,

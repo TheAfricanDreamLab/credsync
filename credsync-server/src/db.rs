@@ -64,12 +64,50 @@ pub async fn migrate(client: &Client) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// One page of changes, and whether the row ceiling cut it short.
+#[derive(Debug, Clone)]
+pub struct Page {
+    /// The changes read, in `seq` order.
+    pub changes: Vec<Change>,
+    /// Whether more rows exist beyond this page.
+    ///
+    /// Needed because the byte budget is not the only thing that can truncate a read. The row
+    /// ceiling can too, and `fill_batch` cannot tell the difference from its side: a hundred small
+    /// tombstones fit a 100 KB budget easily, so every candidate is chosen and `has_more` would
+    /// read `false` while rows remain. The scope would then sit still until something else
+    /// happened to it.
+    pub more_beyond: bool,
+}
+
 /// Reads up to `limit` changes for one scope, strictly after `cursor`, in `seq` order.
 ///
 /// `limit` is a **safety ceiling on rows read**, not the batch size — the batch is sized by
 /// compressed bytes (`docs/spec.md` §2). Its job is to stop one request pulling a million rows
-/// into memory before the budget is even measured. Read one more than could possibly fit so the
-/// caller can set `has_more` without a second query.
+/// into memory before the budget is even measured. One extra row is read beyond the ceiling so
+/// [`Page::more_beyond`] can be answered without a second query.
+///
+/// # Why the snapshot guard, and not just `seq > cursor`
+///
+/// `seq` is a `bigserial`, which allocates when the `INSERT` runs — but a row becomes **visible**
+/// when its transaction commits, and those two orders are not the same. Demonstrated against
+/// Postgres 14:
+///
+/// ```text
+///   A: BEGIN; INSERT -> seq 1; (still open)
+///   B:        INSERT -> seq 2; COMMIT
+///   reader sees: seq 2 only
+/// ```
+///
+/// A client would take `seq 2`, advance its cursor past `1`, and **never be given change 1** —
+/// silent loss of exactly the kind this project exists to prevent, invisible to every ordering
+/// check because the batch it received was perfectly ordered.
+///
+/// So the query returns only rows whose inserting transaction finished before the oldest
+/// currently-running one began. A row from a transaction that might still be in flight is
+/// withheld, not reordered: the client simply gets it on the next pull, a moment later.
+///
+/// The cost is latency, bounded by how long the slowest concurrent writer holds its transaction
+/// open. The alternative is losing writes, so it is not much of a trade.
 ///
 /// # The scope filter is not optional and not a convenience
 ///
@@ -85,7 +123,7 @@ pub async fn changes_after(
     scope: &ScopeId,
     cursor: u64,
     limit: i64,
-) -> Result<Vec<Change>, ServerError> {
+) -> Result<Page, ServerError> {
     let cursor = i64::try_from(cursor).map_err(|_| ServerError::Corrupt {
         detail: format!("cursor {cursor} does not fit a bigint"),
     })?;
@@ -94,27 +132,39 @@ pub async fn changes_after(
         .query(
             "SELECT seq, entity, entity_id, op, snapshot, row_version, schema_version
                FROM sync_changes
-              WHERE scope = $1 AND seq > $2
+              WHERE scope = $1
+                AND seq > $2
+                AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
               ORDER BY seq ASC
               LIMIT $3",
-            &[&scope.as_str(), &cursor, &limit],
+            &[&scope.as_str(), &cursor, &(limit + 1)],
         )
         .await?;
 
-    rows.into_iter()
+    let more_beyond = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+    let changes = rows
+        .into_iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
         .map(|r| {
-            ChangeRow {
-                seq: r.get(0),
-                entity: r.get(1),
-                entity_id: r.get(2),
-                op: r.get(3),
-                snapshot: r.get(4),
-                row_version: r.get(5),
-                schema_version: r.get(6),
-            }
-            .into_change()
+            Ok(ChangeRow {
+                seq: r.try_get(0)?,
+                entity: r.try_get(1)?,
+                entity_id: r.try_get(2)?,
+                op: r.try_get(3)?,
+                snapshot: r.try_get(4)?,
+                row_version: r.try_get(5)?,
+                schema_version: r.try_get(6)?,
+            })
         })
-        .collect()
+        .collect::<Result<Vec<ChangeRow>, ServerError>>()?
+        .into_iter()
+        .map(ChangeRow::into_change)
+        .collect::<Result<Vec<Change>, ServerError>>()?;
+
+    Ok(Page {
+        changes,
+        more_beyond,
+    })
 }
 
 /// A change about to be written to the log.
