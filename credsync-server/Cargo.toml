@@ -21,8 +21,12 @@ serde_json = "1"
 # a query builder would hide the one thing worth reading — the SQL that the byte budget and the
 # cursor walk depend on. MIT/Apache-2.0, inside the deny.toml allowlist (D-011).
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tokio          = { version = "1", features = ["rt", "macros"] }
+tokio          = { version = "1", features = ["rt", "macros", "time"] }
+jsonwebtoken = "9"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
+base64 = "0.23.1"
+jsonwebtoken = { version = "9", features = ["use_pem"] }
 # The integration tests run against a real Postgres, so they need a runtime to drive it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

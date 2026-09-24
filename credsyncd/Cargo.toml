@@ -13,3 +13,19 @@ homepage.workspace     = true
 workspace = true
 
 [dependencies]
+axum = "0.8"
+credsync-protocol = { version = "0.0.1", path = "../credsync-protocol" }
+credsync-server = { version = "0.0.1", path = "../credsync-server" }
+jsonwebtoken = "9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+
+[dev-dependencies]
+credsync-protocol = { version = "0.0.1", path = "../credsync-protocol" }
+credsync-server = { version = "0.0.1", path = "../credsync-server" }
+jsonwebtoken = "9"
+serde_json = "1.0.151"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5.3", features = ["util"] }

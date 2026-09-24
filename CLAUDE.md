@@ -113,7 +113,7 @@ Pick the weakest tool that actually proves the claim:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
-cargo deny check licenses
+cargo deny check licenses bans sources advisories   # all four; CI runs all four
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
@@ -122,12 +122,20 @@ against a real database and **fail loudly when one is absent** rather than skipp
 goes green on a machine which never ran it is worse than no suite. One command satisfies it:
 
 ```sh
-eval "$(./scripts/test-postgres.sh)"     # throwaway cluster on 55432, exports the URL
+eval "$(./scripts/test-postgres.sh)"     # two throwaway clusters, exports both URLs
 ./scripts/test-postgres.sh --stop        # when you are done
 ```
 
-It touches nothing else: not your own Postgres, not port 5432, not your data directory. CI uses a
-`services: postgres` container instead.
+**Two clusters, not one.** The migration tests (#63) hold write transactions open for tens of
+seconds deliberately, and `changes_after` decides what to withhold from `pg_snapshot_xmin` — the
+oldest transaction running anywhere in the **cluster**, because transaction ids are cluster-wide.
+Measured at CS-17: a transaction held open in a completely unrelated *database* still made a
+committed row read back as `0` of `1`, appearing the instant it ended. So a second database
+isolates nothing and a second cluster does. One command still starts both; the liveness problem
+underneath is #62.
+
+They touch nothing else: not your own Postgres, not port 5432, not your data directory. CI uses two
+`services: postgres` containers instead.
 
 **`RUSTDOCFLAGS`, not `RUSTFLAGS`.** Cargo forwards `RUSTFLAGS` to rustc and *not* to rustdoc, so
 `-D warnings` alone leaves every rustdoc lint — broken intra-doc links included — a warning that
