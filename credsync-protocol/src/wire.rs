@@ -313,33 +313,34 @@ pub struct BootstrapRequest {
     pub after: Cursor,
 }
 
-/// One row in a bootstrap response. Carries no `seq`: these are current rows, not log entries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BootstrapRow {
-    /// Which entity the row belongs to.
-    pub entity: EntityName,
-    /// The row's identifier.
-    pub entity_id: EntityId,
-    /// The full row.
-    pub snapshot: Snapshot,
-    /// Server-assigned row version.
-    pub row_version: RowVersion,
-    /// The schema this snapshot was written under.
-    pub schema_version: SchemaVersion,
-}
-
-/// Response to `GET /sync/bootstrap`.
+/// Response to `GET /sync/bootstrap`. `docs/spec.md` §3.1.
+///
+/// # Why this carries `Change`, not a separate row type
+///
+/// Bootstrap is the **compacted log**: per row, that row's single latest change. It is a slice of
+/// the same log pull walks, with the intermediate versions dropped — so it carries the same values,
+/// applies through the same path, and obeys the same ordering and digest rules. An earlier draft
+/// had a `BootstrapRow` with no `seq` and no `op`, describing current live rows instead.
+///
+/// That was not merely redundant, it was wrong. A row delivered on one page and **deleted** while
+/// the next page is being computed is no longer a live row, so a live-rows bootstrap never resends
+/// it — and its tombstone sits below the `next_cursor` the client joins at, so the log never
+/// delivers it either. The device would hold a deleted row permanently, which is precisely the
+/// silent loss this protocol exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapResponse {
     /// Wire protocol version.
     pub protocol: ProtocolVersion,
     /// The scope bootstrapped.
     pub scope: ScopeId,
-    /// Current rows.
-    pub rows: Vec<BootstrapRow>,
-    /// The log position these rows are consistent with.
+    /// One entry per row: that row's latest change with `seq > after`, in `seq` order.
+    ///
+    /// Tombstones appear when `after > 0`; see the type docs for why they must, and why they are
+    /// omitted for a device starting from nothing.
+    pub changes: Vec<Change>,
+    /// The log position to join at. Covers exactly what was sent, as pull's does.
     pub next_cursor: Cursor,
-    /// Whether more rows remain.
+    /// Whether more entries remain.
     pub has_more: bool,
     /// Checksum over this response's canonical encoding.
     pub checksum: HexString,

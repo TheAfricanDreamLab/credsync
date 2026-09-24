@@ -38,11 +38,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use credsync_protocol::{
-    Batch, BootstrapRequest, BootstrapResponse, BootstrapRow, Change, Command, CommandId,
-    CommandName, CommandResult, ConflictClass, Cursor, EntityId, EntityName, EntityRegistration,
-    ForcedUpgrade, HexString, LimitBytes, Op, Payload, ProtocolVersion, PullRequest, PullResponse,
-    PushRequest, PushResponse, Reason, RowVersion, SchemaVersion, ScopeCursor, ScopeId, Seq,
-    Snapshot, Status, canonical,
+    Batch, BootstrapRequest, BootstrapResponse, Change, Command, CommandId, CommandName,
+    CommandResult, ConflictClass, Cursor, EntityId, EntityName, EntityRegistration, ForcedUpgrade,
+    HexString, LimitBytes, Op, Payload, ProtocolVersion, PullRequest, PullResponse, PushRequest,
+    PushResponse, Reason, RowVersion, SchemaVersion, ScopeCursor, ScopeId, Seq, Snapshot, Status,
+    canonical,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -200,12 +200,14 @@ fixtures! {
         scope: scope(),
         after: Cursor::START,
     };
-    bootstrap_row_fixture: BootstrapRow = "bootstrap_row.json" => bootstrap_row();
+    // Carries a tombstone as well as an upsert, deliberately. `docs/spec.md` §3.1 includes
+    // tombstones once `after > 0`, and a fixture with only live rows would have round-tripped
+    // happily under the old live-rows shape that could not express a delete at all.
     bootstrap_response_fixture: BootstrapResponse = "bootstrap_response.json" =>
         BootstrapResponse {
             protocol: protocol(),
             scope: scope(),
-            rows: vec![bootstrap_row()],
+            changes: vec![change_upsert(), change_delete()],
             next_cursor: Cursor::new(1208).expect("valid cursor"),
             has_more: false,
             checksum: hex("c41d8f0b27e6a35914da70bc8e2f6d03"),
@@ -355,16 +357,6 @@ fn batch() -> Batch {
         has_more: true,
         checksum: hex("3f1a6c9d0e2b48571c83af4d5e60729b"),
         digest: hex("0a7e4411bd903c26ef58d7142b06915c"),
-    }
-}
-
-fn bootstrap_row() -> BootstrapRow {
-    BootstrapRow {
-        entity: entity(),
-        entity_id: EntityId::new("refl:0191f0c3").expect("valid entity_id"),
-        snapshot: Snapshot::new(snapshot_value()).expect("valid snapshot"),
-        row_version: RowVersion::new(41).expect("valid row_version"),
-        schema_version: schema_version(),
     }
 }
 

@@ -18,9 +18,10 @@
 
 use crate::rng::Rng;
 use credsync_protocol::{
-    Batch, Change, Command, CommandId, CommandResult, Cursor, EntityId, EntityName, HexString, Op,
-    ProtocolVersion, PullRequest, PullResponse, PushRequest, PushResponse, RowVersion,
-    SchemaVersion, ScopeDigest, ScopeId, Seq, Snapshot, Status, payload_checksum,
+    Batch, BootstrapRequest, BootstrapResponse, Change, Command, CommandId, CommandResult, Cursor,
+    EntityId, EntityName, HexString, Op, ProtocolVersion, PullRequest, PullResponse, PushRequest,
+    PushResponse, RowVersion, SchemaVersion, ScopeDigest, ScopeId, Seq, Snapshot, Status,
+    payload_checksum,
 };
 use credsync_server::Compressor;
 use std::collections::BTreeMap;
@@ -402,8 +403,93 @@ impl Server {
         (idx > 0).then(|| versions[idx - 1].1)
     }
 
-    /// Applies a push, deduping replays and recording every outcome.
+    /// Answers a bootstrap: the compacted log for a scope. `docs/spec.md` §3.1.
+    ///
+    /// Per row, that row's single latest **visible** change with `seq > after`, in `seq` order,
+    /// through the same [`credsync_server::fill_batch`] pull uses — so the byte budget, the
+    /// oversized-change rule and `next_cursor` are the shipping code here too.
+    ///
+    /// Tombstones are included when `after > 0` and skipped when `after = 0`. The asymmetry is the
+    /// whole reason bootstrap returns the compacted log rather than live rows: a row delivered on
+    /// one page and deleted while the next is computed is no longer live, so a live-rows bootstrap
+    /// would never resend it, and its tombstone sits below the `next_cursor` the device joins at.
+    /// The device would hold a deleted row for good. With `after = 0` the device holds nothing, so
+    /// a historical tombstone would be noise.
+    ///
+    /// Visibility follows the same commit-order guard as pull: an uncommitted write must not push
+    /// `next_cursor` past a change the device will never be given.
     #[must_use]
+    pub fn bootstrap(&self, request: &BootstrapRequest, budget_bytes: usize) -> BootstrapResponse {
+        let after = request.after.get();
+        let scope = &request.scope;
+
+        // Per (entity, entity_id), the latest visible entry. A BTreeMap keyed by the row makes the
+        // compaction explicit and keeps the result deterministic.
+        let mut latest: BTreeMap<RowKey, (u64, Change)> = BTreeMap::new();
+        if let Some(indices) = self.by_scope.get(scope) {
+            for &i in indices {
+                let entry = &self.log[i];
+                if !entry.visible && self.commit_order_guard {
+                    // Stop at the first uncommitted entry, exactly as pull does: anything beyond
+                    // it may be reordered relative to a change the device has not been given.
+                    break;
+                }
+                if !entry.visible {
+                    continue;
+                }
+                let key = (entry.change.entity.clone(), entry.change.entity_id.clone());
+                let seq = entry.seq.get();
+                latest
+                    .entry(key)
+                    .and_modify(|held| {
+                        if seq > held.0 {
+                            *held = (seq, entry.change.clone());
+                        }
+                    })
+                    .or_insert_with(|| (seq, entry.change.clone()));
+            }
+        }
+
+        let mut candidates: Vec<Change> = latest
+            .into_values()
+            .filter(|(seq, change)| *seq > after && (change.op != Op::Delete || after > 0))
+            .map(|(_, change)| change)
+            .collect();
+        candidates.sort_by_key(|c| c.seq.get());
+
+        let cursor = Cursor::new(after).unwrap_or(Cursor::START);
+        let digest = self.digest(scope).to_hex();
+
+        let batch = credsync_server::fill_batch(
+            scope,
+            cursor,
+            candidates,
+            false,
+            budget_bytes,
+            &SimCompressor,
+            digest.clone(),
+        )
+        .unwrap_or_else(|_| Batch {
+            scope: scope.clone(),
+            changes: Vec::new(),
+            next_cursor: cursor,
+            has_more: false,
+            checksum: hex_placeholder(),
+            digest: digest.clone(),
+        });
+
+        BootstrapResponse {
+            protocol: request.protocol,
+            scope: scope.clone(),
+            changes: batch.changes,
+            next_cursor: batch.next_cursor,
+            has_more: batch.has_more,
+            checksum: batch.checksum,
+            digest: batch.digest,
+        }
+    }
+
+    /// Applies a push, deduping replays and recording every outcome.
     pub fn push(&mut self, request: &PushRequest, rng: &mut Rng) -> PushResponse {
         self.push_prefix(request, request.commands.len(), rng)
     }
@@ -628,6 +714,77 @@ impl Server {
             .insert((entity.clone(), entity_id.clone()), row_version);
 
         self.push_entry(seq, scope, entity, entity_id, row_version);
+    }
+
+    /// An external write to a **named** row, for tests that need to touch a specific one.
+    ///
+    /// [`external_change`](Self::external_change) picks a row from the seed, which is right for a
+    /// simulation and useless when a test needs to edit the row it just watched arrive.
+    pub fn external_change_to(
+        &mut self,
+        scope: &ScopeId,
+        entity: &EntityName,
+        entity_id: &str,
+        _rng: &mut Rng,
+    ) {
+        let seq = Seq::new(self.next_seq).unwrap_or_else(|_| unreachable!("seq starts at 1"));
+        self.next_seq += 1;
+
+        let Ok(entity_id) = EntityId::new(entity_id.to_owned()) else {
+            return;
+        };
+        let row_version = RowVersion::new(seq.get()).unwrap_or_else(|_| unreachable!("seq >= 1"));
+
+        self.rows
+            .entry(scope.clone())
+            .or_default()
+            .insert((entity.clone(), entity_id.clone()), row_version);
+
+        self.push_entry(seq, scope, entity, entity_id, row_version);
+    }
+
+    /// Deletes a row, appending a tombstone to the log.
+    ///
+    /// `docs/spec.md` §1: a delete is a change like any other, carrying no snapshot. The row leaves
+    /// the live set and the tombstone stays in the log, which is what lets a device that already
+    /// holds the row learn that it is gone.
+    pub fn external_delete(&mut self, scope: &ScopeId, entity: &EntityName, entity_id: &str) {
+        let Ok(entity_id) = EntityId::new(entity_id.to_owned()) else {
+            return;
+        };
+        let seq = Seq::new(self.next_seq).unwrap_or_else(|_| unreachable!("seq starts at 1"));
+        self.next_seq += 1;
+        let row_version = RowVersion::new(seq.get()).unwrap_or_else(|_| unreachable!("seq >= 1"));
+
+        self.rows
+            .entry(scope.clone())
+            .or_default()
+            .remove(&(entity.clone(), entity_id.clone()));
+
+        let change = Change {
+            seq,
+            entity: entity.clone(),
+            entity_id: entity_id.clone(),
+            op: Op::Delete,
+            snapshot: None,
+            row_version,
+            schema_version: SchemaVersion::new(1)
+                .unwrap_or_else(|_| unreachable!("1 is a valid schema version")),
+        };
+
+        let index = self.log.len();
+        self.log.push(LogEntry {
+            seq,
+            change,
+            visible: true,
+        });
+        self.by_scope.entry(scope.clone()).or_default().push(index);
+        self.row_history
+            .entry(scope.clone())
+            .or_default()
+            .entry((entity.clone(), entity_id))
+            .or_default()
+            .push((seq.get(), row_version));
     }
 
     /// The protocol version this server speaks.

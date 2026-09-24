@@ -91,15 +91,15 @@ is canonical JSON. The rules in §2 apply to bodies.
 
 ```http
 request:  ?protocol=1&scope=s1&after=0     # `after` resumes a partial bootstrap
-response: { protocol: 1, scope: 's1', rows: [ { entity, entity_id, snapshot,
-            row_version, schema_version } ], next_cursor, has_more,
+response: { protocol: 1, scope: 's1', changes: [ { seq, entity, entity_id, op,
+            snapshot, row_version, schema_version } ], next_cursor, has_more,
             checksum, digest }
 ```
 
-A device with no local state for a scope bootstraps here, then joins the log at `next_cursor`.
-Paginated and byte-budgeted like pull, and resumable via `after`. Concurrent writes during
-bootstrap are safe: `next_cursor` is the log position the returned rows are consistent with, so
-joining the log there neither loses nor double-applies a concurrent write.
+**Bootstrap is the compacted log, not live rows**: per row, its single latest change with
+`seq > after`, in `seq` order. `after` and `next_cursor` are pull's currency, so one `u64` resumes a
+partial run and the device joins the log at `next_cursor`. **Tombstones are included when
+`after > 0`**: a row deleted mid-bootstrap was already sent, and live rows alone would strand it.
 
 ### 3.2 Pull — `GET /sync/pull`
 
