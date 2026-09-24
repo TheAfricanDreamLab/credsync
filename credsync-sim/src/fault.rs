@@ -51,6 +51,15 @@ pub struct FaultRates {
     pub server_restart: u32,
     /// Restart a device, reloading its engine from storage.
     pub device_restart: u32,
+    /// Hold a write's transaction open so it takes a `seq` now and commits later.
+    ///
+    /// `seq` is allocated when a write starts and the row becomes visible when it commits, so a
+    /// later `seq` can appear before an earlier one. Without this fault the simulated server
+    /// committed every write instantly, no two writes were ever in flight, and the whole class of
+    /// bug was unreachable — a server losing changes this way would have run green forever
+    /// (D-063, D-064).
+    pub slow_commit: u32,
+
     /// Send a structurally valid batch that breaks a protocol rule.
     ///
     /// Distinct from `malformed_bytes`, which produces something that does not decode at all. A
@@ -85,6 +94,7 @@ impl Default for FaultRates {
             server_restart: 2,
             device_restart: 3,
             protocol_violation: 5,
+            slow_commit: 8,
             latency_ms: (20, 2_000),
         }
     }
@@ -106,6 +116,7 @@ impl FaultRates {
             server_restart: 0,
             device_restart: 0,
             protocol_violation: 0,
+            slow_commit: 0,
             latency_ms: (10, 10),
         }
     }
@@ -140,6 +151,8 @@ pub enum Fault {
     DeviceRestarted,
     /// The server sent a batch that decoded cleanly and broke a protocol rule.
     ProtocolViolation,
+    /// A write took its `seq` and stayed uncommitted for a while.
+    SlowCommit,
 }
 
 impl Fault {
@@ -161,6 +174,7 @@ impl Fault {
             Self::ServerRestarted => "server-restarted",
             Self::DeviceRestarted => "device-restarted",
             Self::ProtocolViolation => "protocol-violation",
+            Self::SlowCommit => "slow-commit",
         }
     }
 
@@ -168,7 +182,7 @@ impl Fault {
     ///
     /// A `const` list rather than a derived iterator so that adding a variant without adding it
     /// here is visible: the coverage report would show one fewer row than the menu.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Dropped,
         Self::Duplicated,
         Self::Reordered,
@@ -180,6 +194,7 @@ impl Fault {
         Self::ServerRestarted,
         Self::DeviceRestarted,
         Self::ProtocolViolation,
+        Self::SlowCommit,
     ];
 }
 

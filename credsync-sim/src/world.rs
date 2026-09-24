@@ -209,6 +209,13 @@ impl World {
         for _ in 0..600 {
             self.step();
         }
+        // Everything must have committed before convergence is judged. An uncommitted write is a
+        // change no client could have been given, so counting it would fail every run.
+        assert!(
+            self.server.in_flight_writes() == 0,
+            "settling left {} write(s) uncommitted",
+            self.server.in_flight_writes()
+        );
         self.rates = hostile;
         self.quiet = false;
 
@@ -225,6 +232,18 @@ impl World {
 
         for d in &self.devices {
             d.clock.advance_to(self.now_ms);
+        }
+
+        // Commits land before anything else in the step, so a write held open last step becomes
+        // visible before this step's reads.
+        self.server.advance_commits();
+
+        // A writer holding its transaction open. The delay is drawn from the seed, so a run still
+        // replays exactly — the simulator models concurrency without ever being concurrent.
+        if !self.quiet && self.rng.chance(self.rates.slow_commit) {
+            let delay = self.rng.range(1, 4);
+            self.server.hold_next_write(delay);
+            self.trace.fault(self.now_ms, 0, Fault::SlowCommit);
         }
 
         if self.rng.chance(self.rates.server_restart) {
@@ -600,6 +619,16 @@ impl World {
                 .map(|d| credsync_core::Clock::now(&d.clock).as_millis())
                 .collect(),
         )
+    }
+
+    /// Turns off the server's commit-order guard, so it hands over changes whose predecessors
+    /// have not committed.
+    ///
+    /// For the drill in `tests/commit_order.rs` and nothing else. A run with this set models the
+    /// bug D-063 fixed, and the invariants must catch it — a simulator that cannot fail on a bug
+    /// class is a simulator that does not test it.
+    pub const fn disable_commit_order_guard(&mut self) {
+        self.server.commit_order_guard = false;
     }
 
     /// The scope every device in this run subscribes to.

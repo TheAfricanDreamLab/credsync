@@ -154,6 +154,24 @@ The lesson worth carrying: **an invariant that has never fired tells you nothing
 only about itself.** Two of these had passed a thousand seeds while being unable to see the bug
 class they were written for.
 
+### The blind spot the drill did not find
+
+One class got past both the drill and the invariants, and was caught by code review instead: the
+simulated server committed every write instantly, so **no two writes were ever in flight**. The
+commit-order gap — a later `seq` becoming visible before an earlier one, and a client advancing
+its cursor past a change it will never be given — was not a bug the rig failed to notice. It was a
+bug the rig could not represent.
+
+Modelled now (D-064), with `Server::commit_order_guard` to toggle the fix so the hazard can be
+demonstrated. But the general point outlives that fix:
+
+> A simulator is blind to any hazard its model does not contain, and the absence of a failure says
+> nothing about the absence of a bug.
+
+Before trusting a green batch on a new area, ask what the model *cannot* express. For this rig, as
+of CS-15: one scope per run, one server process, no clock skew between server and client, no
+partial writes within a transaction.
+
 ### Choosing a bug to plant
 
 Not every mutation is a bug. Two of the first attempts at the ordering bug caused no damage at
