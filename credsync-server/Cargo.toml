@@ -12,6 +12,18 @@ homepage.workspace     = true
 [lints]
 workspace = true
 
+[features]
+# The Postgres-backed half of this crate. On by default, because a server that cannot talk to a
+# database is not much of a server.
+#
+# Turning it off leaves the parts that are pure functions over wire types -- the compressed byte
+# budget, the token verifier, the dedupe decision -- with no `tokio-postgres` and no `tokio` in the
+# graph. That is what lets `credsync-sim` run the **real** server logic inside a seeded run: the
+# simulator cannot use a database without destroying determinism, and a second implementation of
+# the byte budget for it to test against would be testing the copy rather than the code.
+default  = ["postgres"]
+postgres = ["dep:tokio-postgres", "dep:tokio"]
+
 [dependencies]
 # The server owns the wire's other side; the protocol crate owns the wire itself.
 credsync-protocol = { path = "../credsync-protocol", version = "0.0.1" }
@@ -20,8 +32,8 @@ serde_json = "1"
 # Postgres. `tokio-postgres` rather than an ORM: the server owns two tables and four queries, and
 # a query builder would hide the one thing worth reading — the SQL that the byte budget and the
 # cursor walk depend on. MIT/Apache-2.0, inside the deny.toml allowlist (D-011).
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tokio          = { version = "1", features = ["rt", "macros", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"], optional = true }
+tokio          = { version = "1", features = ["rt", "macros", "time"], optional = true }
 jsonwebtoken = "9"
 serde = { version = "1.0.229", features = ["derive"] }
 

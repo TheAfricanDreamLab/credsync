@@ -18,6 +18,10 @@
 //!
 //! CI supplies it from a `services: postgres` container; see `.github/workflows/rust.yml`.
 
+// This file needs the `postgres` feature: it drives a real database. With the feature off (which
+// is how `credsync-sim` depends on this crate) it compiles to an empty test binary rather than a
+// build failure.
+#![cfg(feature = "postgres")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use credsync_protocol::{Cursor, HexString, ScopeId};

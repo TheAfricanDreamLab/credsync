@@ -26,10 +26,15 @@
 //!
 //! This is why [`Forwarded::Unresolved`] exists rather than a convenient `Rejected`.
 
+#[cfg(feature = "postgres")]
 use crate::dedupe::{self, Decision};
+#[cfg(feature = "postgres")]
 use crate::error::ServerError;
 use core::future::Future;
-use credsync_protocol::{Command, CommandResult, Reason, Seq, Status};
+#[cfg(feature = "postgres")]
+use credsync_protocol::Status;
+use credsync_protocol::{Command, CommandResult, Reason, Seq};
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 /// What the host decided about a command.
@@ -168,6 +173,7 @@ impl Forwarded {
 /// # Errors
 /// Returns [`ServerError`] if the dedupe table cannot be read or written. A *host* failure is not
 /// an error here — it is an outcome of forwarding, reported as [`Forwarded::Unresolved`].
+#[cfg(feature = "postgres")]
 pub async fn forward<H: Host>(
     client: &Client,
     host: &H,

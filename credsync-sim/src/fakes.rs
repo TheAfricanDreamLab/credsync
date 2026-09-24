@@ -169,9 +169,21 @@ pub struct Db {
     pub verdict: StorageVerdict,
     /// Transactions that committed, for the trace.
     pub commits: u64,
+    /// Every command id this device has ever enqueued.
+    ///
+    /// The outbox drains and `resolved` only grows for commands that got an answer, so neither
+    /// alone can tell you a command *vanished*. This is the set to check against: a command that
+    /// is in here and in neither of the others left without a trace, and the user's write is gone.
+    pub enqueued: std::collections::BTreeSet<CommandId>,
 }
 
 impl Db {
+    /// Every command id this device has ever enqueued.
+    #[must_use]
+    pub fn enqueued_ids(&self) -> Vec<CommandId> {
+        self.enqueued.iter().copied().collect()
+    }
+
     /// A copy of this database, for tests that need to compare an intact state against a broken
     /// one built from it.
     ///
@@ -188,6 +200,7 @@ impl Db {
             recovered: self.recovered.clone(),
             verdict: self.verdict,
             commits: self.commits,
+            enqueued: self.enqueued.clone(),
         }
     }
 
@@ -202,6 +215,7 @@ impl Db {
             recovered: self.recovered.clone(),
             verdict: StorageVerdict::Commit,
             commits: self.commits,
+            enqueued: self.enqueued.clone(),
         };
 
         for op in ops {
@@ -236,6 +250,10 @@ impl Db {
                     schema_version,
                 } => {
                     next.outbox.push((command.clone(), *schema_version));
+                    // Staged with the write, so an enqueue that rolls back is not remembered as
+                    // having happened. A test asserting "this command vanished" must not fire for
+                    // a command the transaction never committed in the first place.
+                    next.enqueued.insert(command.id);
                 }
                 StorageOp::ResolveCommand { id, resolution } => {
                     next.outbox.retain(|(c, _)| c.id != *id);

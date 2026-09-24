@@ -5,6 +5,10 @@
 //! return a 5xx, refuse the connection, or apply the command and *then* fail to answer. That last
 //! one is the case the whole design turns on, and it is the one a naive implementation gets wrong.
 
+// This file needs the `postgres` feature: it drives a real database. With the feature off (which
+// is how `credsync-sim` depends on this crate) it compiles to an empty test binary rather than a
+// build failure.
+#![cfg(feature = "postgres")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use credsync_protocol::{

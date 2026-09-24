@@ -22,7 +22,10 @@
 //! `CREATE TABLE IF NOT EXISTS` race that CI found in the migration.
 
 use crate::error::ServerError;
-use credsync_protocol::{Command, CommandId, CommandResult, Reason, Seq, Status, payload_checksum};
+use credsync_protocol::{Command, CommandResult, Reason, payload_checksum};
+#[cfg(feature = "postgres")]
+use credsync_protocol::{CommandId, Seq, Status};
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 /// What the server decided about a submitted command.
@@ -90,6 +93,51 @@ impl DedupeStats {
     }
 }
 
+/// What the store already holds for a command id.
+///
+/// The two fields a decision actually turns on. Deliberately not a database row: the same
+/// judgement has to be made by the Postgres server and by the simulator, and a type that named
+/// columns would force one of them to pretend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    /// The checksum of the body that produced the recorded outcome.
+    pub checksum: String,
+    /// What was decided.
+    pub result: CommandResult,
+}
+
+/// Decides what a submission is, given whatever the store holds for its id.
+///
+/// **The whole dedupe rule, as a pure function.** No database, no clock, no I/O — so the Postgres
+/// server and the simulator run this exact code rather than two implementations that agree until
+/// the day they do not.
+///
+/// The security property lives here (`docs/spec.md` §5): a replay is only a replay when the body
+/// matches. Returning the recorded success for a mismatched body would make the dedupe table a way
+/// to launder tampered commands — send a command, note that it succeeded, resend the id with a
+/// different body, collect the original's success, payload never looked at.
+///
+/// # Errors
+/// Returns [`ServerError::Corrupt`] if the submitted payload cannot be encoded for checksumming.
+pub fn decide(command: &Command, recorded: Option<&Recorded>) -> Result<Decision, ServerError> {
+    let submitted = payload_checksum(&command.payload).map_err(|_| ServerError::Corrupt {
+        detail: "a submitted payload could not be encoded for checksumming".to_owned(),
+    })?;
+
+    let Some(recorded) = recorded else {
+        return Ok(Decision::Fresh);
+    };
+
+    if recorded.checksum != submitted.as_str() {
+        return Ok(Decision::Mutated {
+            recorded: recorded.checksum.clone(),
+            submitted: submitted.as_str().to_owned(),
+        });
+    }
+
+    Ok(Decision::Replay(recorded.result.clone()))
+}
+
 /// Looks up a command, deciding whether it is fresh, a replay, or a mutated reuse.
 ///
 /// Does not write. Recording the outcome is [`record`], which happens after the host has decided
@@ -98,11 +146,8 @@ impl DedupeStats {
 /// # Errors
 /// Returns [`ServerError::Database`] if the lookup fails, or [`ServerError::Corrupt`] if a stored
 /// record cannot be read back as a valid result.
+#[cfg(feature = "postgres")]
 pub async fn classify(client: &Client, command: &Command) -> Result<Decision, ServerError> {
-    let submitted = payload_checksum(&command.payload).map_err(|_| ServerError::Corrupt {
-        detail: "a submitted payload could not be encoded for checksumming".to_owned(),
-    })?;
-
     let rows = client
         .query(
             "SELECT payload_checksum, status, reason, server_seq
@@ -112,24 +157,21 @@ pub async fn classify(client: &Client, command: &Command) -> Result<Decision, Se
         )
         .await?;
 
-    let Some(row) = rows.first() else {
-        return Ok(Decision::Fresh);
+    // Read the row, then let `decide` rule on it. The database's job is to remember; the rule
+    // about what a memory *means* is the same rule the simulator runs.
+    let recorded = match rows.first() {
+        None => None,
+        Some(row) => Some(Recorded {
+            checksum: row.get(0),
+            result: read_result(command.id, row)?,
+        }),
     };
 
-    let recorded: String = row.get(0);
-    if recorded != submitted.as_str() {
-        // `docs/spec.md` §5. The id is known, the body is not the one that produced the recorded
-        // outcome, and returning that outcome would be laundering.
-        return Ok(Decision::Mutated {
-            recorded,
-            submitted: submitted.as_str().to_owned(),
-        });
-    }
-
-    Ok(Decision::Replay(read_result(command.id, row)?))
+    decide(command, recorded.as_ref())
 }
 
 /// Rebuilds a [`CommandResult`] from a stored row.
+#[cfg(feature = "postgres")]
 fn read_result(id: CommandId, row: &tokio_postgres::Row) -> Result<CommandResult, ServerError> {
     let status: String = row.get(1);
     let reason: Option<String> = row.get(2);
@@ -180,6 +222,7 @@ fn read_result(id: CommandId, row: &tokio_postgres::Row) -> Result<CommandResult
 /// # Errors
 /// Returns [`ServerError::Database`] if the write fails, or [`ServerError::Corrupt`] if the row
 /// that won cannot be read back.
+#[cfg(feature = "postgres")]
 pub async fn record(
     client: &Client,
     command: &Command,
