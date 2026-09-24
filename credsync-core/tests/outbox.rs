@@ -181,7 +181,7 @@ fn the_entry_count_cap_binds_too() {
 
 #[test]
 fn an_empty_outbox_produces_no_request() {
-    let (engine, _storage) = new_engine();
+    let (mut engine, _storage) = new_engine();
     assert!(
         engine
             .build_push(protocol(), 1000)

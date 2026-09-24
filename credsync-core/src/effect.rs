@@ -11,7 +11,7 @@
 //! behaviour.
 
 use crate::types::Timestamp;
-use credsync_protocol::{HexString, ScopeId};
+use credsync_protocol::{EntityId, EntityName, HexString, SchemaVersion, ScopeId};
 
 /// Something the caller must do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,38 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Telemetry {
+    /// A row arrived under a schema this app could not migrate, and was set aside.
+    ///
+    /// Worth surfacing rather than logging: it means a device is holding data it cannot display,
+    /// which the user will experience as something missing. In aggregate it is also the signal
+    /// that a host shipped a schema bump without the matching migration — one device reporting it
+    /// is a curiosity, a cohort reporting it is an incident.
+    RowQuarantined {
+        /// Which entity the row belongs to.
+        entity: EntityName,
+        /// The row's identifier.
+        entity_id: EntityId,
+        /// The schema the row is written under.
+        schema_version: SchemaVersion,
+        /// Why it could not be migrated.
+        reason: String,
+    },
+
+    /// A queued command could not be migrated forward, so it was held rather than sent.
+    ///
+    /// **Held, not dropped.** `docs/spec.md` §7: *"A command whose schema the server no longer
+    /// accepts is queued, never dropped."* The entry stays in the outbox and this reports why it
+    /// is not moving, so the user is told rather than left watching an edit that silently never
+    /// saves.
+    CommandHeld {
+        /// Which command is stuck.
+        command: credsync_protocol::CommandId,
+        /// The schema it was authored under.
+        authored_under: SchemaVersion,
+        /// Why it could not be migrated.
+        reason: String,
+    },
+
     /// A scope's digest did not match the server's after applying a batch.
     ///
     /// **Silent divergence** — the class of bug that testing missed and users never report until

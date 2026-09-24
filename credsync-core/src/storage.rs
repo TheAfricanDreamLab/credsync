@@ -108,6 +108,34 @@ pub enum StorageOp {
         payload: Payload,
     },
 
+    /// Set a row aside because it could not be migrated, keeping the original bytes.
+    ///
+    /// `docs/spec.md` §7 requires the client to apply registered up-migrations. When one is
+    /// missing or fails, the choice is between writing a document the app cannot read, discarding
+    /// it, or setting it aside — and the first two are both data loss, one noisy and one silent.
+    ///
+    /// **The snapshot is stored exactly as it arrived.** A quarantine that stored a half-migrated
+    /// value would destroy the only copy of what the server actually sent, so the row could never
+    /// be recovered by a later app version that does know the migration. That later version is the
+    /// entire point of keeping it.
+    ///
+    /// The row's `row_version` still contributes to the scope digest, because the device *has*
+    /// received it — it simply cannot read it. Leaving it out would report divergence against a
+    /// server the client has not actually diverged from, and send it re-bootstrapping into the
+    /// same unreadable row.
+    QuarantineRow {
+        /// Which entity the row belongs to.
+        entity: EntityName,
+        /// The row's identifier.
+        entity_id: EntityId,
+        /// The row exactly as it arrived, unmigrated.
+        snapshot: Snapshot,
+        /// The version the snapshot is written under, not the one the app wanted.
+        schema_version: SchemaVersion,
+        /// Why it could not be migrated, for the operator and the user.
+        reason: String,
+    },
+
     /// Append a command to the outbox.
     ///
     /// `schema_version` is recorded with it because `docs/spec.md` §7 requires that an upgraded

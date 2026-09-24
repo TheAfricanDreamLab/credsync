@@ -14,7 +14,9 @@
 //! Without the mapping, "no command may target a server-authoritative entity" would be
 //! unenforceable — the engine would be looking at an opaque name and a payload it does not model.
 
-use credsync_protocol::{Command, CommandName, ConflictClass, EntityName, EntityRegistration};
+use credsync_protocol::{
+    Command, CommandName, ConflictClass, EntityName, EntityRegistration, SchemaVersion,
+};
 use std::collections::BTreeMap;
 
 /// Why the registry refused something.
@@ -107,6 +109,15 @@ impl Registry {
     #[must_use]
     pub fn entity(&self, entity: &EntityName) -> Option<&EntityRegistration> {
         self.entities.get(entity)
+    }
+
+    /// The schema version this app understands for an entity.
+    ///
+    /// What incoming rows are migrated *to*, and what queued commands are migrated *up to* before
+    /// being pushed (`docs/spec.md` §7).
+    #[must_use]
+    pub fn schema_version_of(&self, entity: &EntityName) -> Option<SchemaVersion> {
+        self.entities.get(entity).map(|r| r.schema_version)
     }
 
     /// The conflict class an entity was registered under.

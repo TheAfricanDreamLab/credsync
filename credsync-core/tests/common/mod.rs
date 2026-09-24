@@ -55,6 +55,8 @@ pub struct FakeStorage {
     pub resolved: Vec<(CommandId, credsync_core::Resolution)>,
     /// Recovered drafts: the command whose edit lost, its entity, and the content preserved.
     pub recovered: Vec<(CommandId, EntityName, Payload)>,
+    /// Rows set aside because they could not be migrated, with the bytes exactly as they arrived.
+    pub quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
 }
 
 impl FakeStorage {
@@ -87,6 +89,13 @@ impl FakeStorage {
         self.rows.get(&(entity.clone(), entity_id.clone()))
     }
 
+    /// Rows set aside because they could not be migrated.
+    #[must_use]
+    pub fn quarantined(&self) -> Vec<(EntityId, Snapshot, SchemaVersion, String)> {
+        self.quarantine.clone()
+    }
+
+    /// How many live rows are stored.
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.rows.len()
@@ -115,6 +124,7 @@ impl FakeStorage {
             queued: self.queued.clone(),
             resolved: self.resolved.clone(),
             recovered: self.recovered.clone(),
+            quarantine: self.quarantine.clone(),
         };
 
         for op in ops {
@@ -162,6 +172,24 @@ impl FakeStorage {
                     s.recovered
                         .push((*command_id, entity.clone(), payload.clone()));
                 }
+                StorageOp::QuarantineRow {
+                    entity_id,
+                    snapshot,
+                    schema_version,
+                    reason,
+                    ..
+                } => {
+                    s.quarantine.push((
+                        entity_id.clone(),
+                        snapshot.clone(),
+                        *schema_version,
+                        reason.clone(),
+                    ));
+                }
+                // `StorageOp` is `#[non_exhaustive]`, so an adapter must have this arm. That makes
+                // it the place a new op goes to die quietly: a variant nobody handled is a write
+                // the engine believes it made. The conformance suite is what catches that for real
+                // adapters; here, every variant above is handled explicitly for the same reason.
                 _ => {}
             }
         }
@@ -179,6 +207,7 @@ pub struct Snapshotted {
     queued: Vec<(CommandId, SchemaVersion)>,
     resolved: Vec<(CommandId, credsync_core::Resolution)>,
     recovered: Vec<(CommandId, EntityName, Payload)>,
+    quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
 }
 
 impl Storage for FakeStorage {
@@ -200,6 +229,7 @@ impl Storage for FakeStorage {
         self.queued = staged.queued;
         self.resolved = staged.resolved;
         self.recovered = staged.recovered;
+        self.quarantine = staged.quarantine;
         self.commits += 1;
         Ok(TxOutcome::new(ops.len()))
     }
@@ -530,6 +560,34 @@ pub fn register_defaults(registry: &mut credsync_core::Registry) {
             EntityName::new(entity).expect("valid entity"),
         );
     }
+}
+
+/// An engine whose `reflections` entity is registered at a given schema version.
+///
+/// CS-20 needs a registry that says "this app understands v3" so a v1 row or a v1 queued command
+/// has somewhere to be migrated *to*. `register_defaults` pins everything at one version, which is
+/// right for every other test and useless here.
+#[must_use]
+pub fn engine_with_schema(schema_version: u16) -> (TestEngine, SharedStorage) {
+    let (mut engine, storage) = new_engine_unregistered();
+    let registry = engine.registry_mut();
+    registry.register_entity(EntityRegistration {
+        entity: entity(),
+        scope: scope(),
+        conflict_class: ConflictClass::OwnerDraft,
+        schema_version: SchemaVersion::new(schema_version).expect("valid schema version"),
+    });
+    registry.register_command(
+        CommandName::new("submit_reflection").expect("valid name"),
+        entity(),
+    );
+    (engine, storage)
+}
+
+/// A command with a trivial payload, for tests that only care about identity and schema.
+#[must_use]
+pub fn command_n(n: u8) -> Command {
+    command(n, 0)
 }
 
 /// A command with an explicit name, for registry tests.

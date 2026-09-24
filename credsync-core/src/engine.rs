@@ -9,7 +9,8 @@
 //! would rather have.
 
 use crate::apply::{self, Applied, ApplyError};
-use crate::effect::Effect;
+use crate::effect::{Effect, Telemetry};
+use crate::migrate::{MigrationError, Migrations};
 use crate::outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
 use crate::registry::Registry;
 use crate::scope::ScopeState;
@@ -17,8 +18,9 @@ use crate::storage::StorageOp;
 use crate::traits::{Clock, Compressor, Entropy, Storage, Transport};
 use core::fmt;
 use credsync_protocol::{
-    Batch, BootstrapResponse, Command, CommandId, ConflictClass, ProtocolVersion, PushRequest,
-    PushResponse, Reason, ScopeId, Status, canonical, limits,
+    Batch, BootstrapResponse, Change, Command, CommandId, ConflictClass, EntityId, EntityName,
+    Payload, ProtocolVersion, PushRequest, PushResponse, Reason, SchemaVersion, ScopeId, Snapshot,
+    Status, canonical, limits,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -84,6 +86,8 @@ where
     /// the outside world. Empty by default, which means an engine accepts no commands until the
     /// host declares some — the safe direction to fail.
     registry: Registry,
+    /// The host's registered up-migrations. `docs/spec.md` §7.
+    migrations: Migrations,
 }
 
 impl<C, E, S, T, Z> Engine<C, E, S, T, Z>
@@ -106,6 +110,7 @@ where
             scopes: BTreeMap::new(),
             outbox: VecDeque::new(),
             registry: Registry::default(),
+            migrations: Migrations::new(),
         }
     }
 
@@ -118,6 +123,20 @@ where
     /// The registry, for the host to declare entities and commands into.
     pub const fn registry_mut(&mut self) -> &mut Registry {
         &mut self.registry
+    }
+
+    /// The registered schema migrations.
+    #[must_use]
+    pub const fn migrations(&self) -> &Migrations {
+        &self.migrations
+    }
+
+    /// The migrations, for the host to register up-migrations into.
+    ///
+    /// `docs/spec.md` §7: credSync applies the host's registered up-migrations; it cannot invent
+    /// them, because it does not know what the host's documents mean.
+    pub const fn migrations_mut(&mut self) -> &mut Migrations {
+        &mut self.migrations
     }
 
     /// Seeds a scope's cursor and digest from what storage holds.
@@ -212,18 +231,54 @@ where
         // are therefore invisible to `Storage::row_version`. See `apply::stage_change`.
         let mut staged = apply::Staged::new();
 
+        // Rows that arrived under a schema this app cannot reach, set aside rather than applied.
+        // Reported after the commit: a row is not quarantined until the transaction holding it
+        // actually lands.
+        let mut quarantined: Vec<(EntityName, EntityId, SchemaVersion, String)> = Vec::new();
+
         for change in &batch.changes {
             // The class comes from the registry, so append-only enforcement is driven by the
             // host's declaration rather than by anything hard-coded here.
             let class = self.registry.class_of(&change.entity);
-            apply::stage_change(
-                &self.storage,
-                change,
-                class,
-                &mut digest,
-                &mut ops,
-                &mut staged,
-            )?;
+
+            // `docs/spec.md` §7: the client applies registered up-migrations to local rows. A
+            // change already at this app's version is the common case and costs nothing.
+            match self.migrated_change(change) {
+                Ok(None) => apply::stage_change(
+                    &self.storage,
+                    change,
+                    class,
+                    &mut digest,
+                    &mut ops,
+                    &mut staged,
+                )?,
+                Ok(Some(migrated)) => apply::stage_change(
+                    &self.storage,
+                    &migrated,
+                    class,
+                    &mut digest,
+                    &mut ops,
+                    &mut staged,
+                )?,
+                Err(e) => {
+                    // Set aside, never discarded and never half-migrated. See `stage_quarantine`.
+                    let reason = e.to_string();
+                    apply::stage_quarantine(
+                        &self.storage,
+                        change,
+                        &mut digest,
+                        &mut ops,
+                        &mut staged,
+                        &reason,
+                    )?;
+                    quarantined.push((
+                        change.entity.clone(),
+                        change.entity_id.clone(),
+                        change.schema_version,
+                        reason,
+                    ));
+                }
+            }
         }
 
         // The cursor and digest ride in the same transaction as the rows. Not a convenience:
@@ -250,6 +305,17 @@ where
             ScopeState::restored(batch.next_cursor, digest),
         );
 
+        // Reported only now, for the same reason: a transaction that failed quarantined nothing,
+        // and telling the host otherwise would have it surface a row that was never set aside.
+        for (entity, entity_id, schema_version, reason) in quarantined {
+            self.emit(Effect::Emit(Telemetry::RowQuarantined {
+                entity,
+                entity_id,
+                schema_version,
+                reason,
+            }));
+        }
+
         // `docs/spec.md` §5: the client compares after apply. A mismatch is silent divergence —
         // both sides walked the same log and hold different rows. Marking the scope tainted and
         // re-bootstrapping is CS-22 (#23); detecting and reporting it is this slice.
@@ -262,6 +328,47 @@ where
             changes: batch.changes.len(),
             diverged,
         })
+    }
+
+    /// Migrates one change's snapshot to this app's schema version, if it needs it.
+    ///
+    /// `Ok(None)` means no migration was needed and the original change should be used as-is —
+    /// the common case, and worth not cloning a 256 KB snapshot for.
+    ///
+    /// # Errors
+    /// Returns [`MigrationError`] if no chain reaches this app's version or a step failed. The
+    /// caller quarantines; nothing is half-migrated.
+    fn migrated_change(&self, change: &Change) -> Result<Option<Change>, MigrationError> {
+        let Some(target) = self.registry.schema_version_of(&change.entity) else {
+            // Unregistered entity: nothing declares what version this app wants, so there is
+            // nothing to migrate to. The change is applied as it arrived.
+            return Ok(None);
+        };
+        if change.schema_version == target {
+            return Ok(None);
+        }
+        let Some(snapshot) = change.snapshot.as_ref() else {
+            // A tombstone carries no document, so its schema version is irrelevant.
+            return Ok(None);
+        };
+
+        let migrated = self.migrations.migrate_value(
+            &change.entity,
+            snapshot.as_value(),
+            change.schema_version,
+            target,
+        )?;
+
+        let snapshot = Snapshot::new(migrated).map_err(|e| MigrationError::Invalid {
+            entity: change.entity.clone(),
+            detail: e.to_string(),
+        })?;
+
+        Ok(Some(Change {
+            snapshot: Some(snapshot),
+            schema_version: target,
+            ..change.clone()
+        }))
     }
 
     /// Queues a client write.
@@ -337,7 +444,7 @@ where
     /// Returns [`OutboxError::Encoding`] if a queued command cannot be encoded, which would mean
     /// a value that passed validation on the way in has since become unrepresentable.
     pub fn build_push(
-        &self,
+        &mut self,
         protocol: ProtocolVersion,
         budget_bytes: usize,
     ) -> Result<Option<PushRequest>, OutboxError> {
@@ -359,12 +466,34 @@ where
         // linear — a rejected command is rolled back by truncating, which is O(1).
         let mut buf: Vec<u8> = vec![b'[', b']'];
 
+        // Commands that could not be migrated forward. They stay queued — see below — and are
+        // reported after the batch is built so the user is told why nothing is moving.
+        let mut held: Vec<(CommandId, SchemaVersion, String)> = Vec::new();
+
         for entry in &self.outbox {
             if chosen.len() >= limits::COMMANDS_MAX_COUNT {
                 break;
             }
 
-            let one = canonical::to_vec(&entry.command).map_err(|_| OutboxError::Encoding)?;
+            // `docs/spec.md` §7: an upgraded app migrates queued commands forward before pushing.
+            // A device offline for three weeks may hold commands authored under a schema the
+            // server has moved past, and sending them unmigrated would have them rejected for a
+            // reason the user cannot act on.
+            //
+            // A command that cannot be migrated is **skipped, not dropped**. `build_push` removes
+            // nothing from the outbox — only `apply_results` does, and only for an id the server
+            // answered — so skipping here leaves the entry exactly where it was, waiting for an
+            // app version that knows the migration.
+            let command = match Self::migrated_command(&self.registry, &self.migrations, entry) {
+                Ok(None) => entry.command.clone(),
+                Ok(Some(migrated)) => migrated,
+                Err(e) => {
+                    held.push((entry.id(), entry.schema_version, e.to_string()));
+                    continue;
+                }
+            };
+
+            let one = canonical::to_vec(&command).map_err(|_| OutboxError::Encoding)?;
 
             // Splice `one` in before the closing bracket: `[a,b]` + c -> `[a,b,c]`.
             let rollback = buf.len();
@@ -386,12 +515,69 @@ where
                 break;
             }
 
-            chosen.push(entry.command.clone());
+            chosen.push(command);
+        }
+
+        // Held, not dropped. Reported so the user learns why an edit is not saving, rather than
+        // watching it sit there silently for the life of the install.
+        for (command, authored_under, reason) in held {
+            self.emit(Effect::Emit(Telemetry::CommandHeld {
+                command,
+                authored_under,
+                reason,
+            }));
         }
 
         Ok(Some(PushRequest {
             protocol,
             commands: chosen,
+        }))
+    }
+
+    /// Migrates one queued command's payload up to this app's schema version, if it needs it.
+    ///
+    /// `Ok(None)` means no migration was needed, so the caller can use the command as-is.
+    ///
+    /// An associated function rather than a method: `build_push` holds `&self.outbox` across this
+    /// call, so taking `&self` here would borrow the engine twice.
+    ///
+    /// # Errors
+    /// Returns [`MigrationError`] if no chain reaches this app's version or a step failed. The
+    /// caller holds the entry; nothing is dropped and nothing is half-migrated.
+    fn migrated_command(
+        registry: &Registry,
+        migrations: &Migrations,
+        entry: &OutboxEntry,
+    ) -> Result<Option<Command>, MigrationError> {
+        let Some(entity) = registry.target_of(&entry.command.name) else {
+            // An unregistered command cannot be queued (`enqueue` refuses it), so this is only
+            // reachable for an outbox restored from storage under a registry that has since
+            // dropped the command. Nothing declares a target version, so there is nothing to
+            // migrate to.
+            return Ok(None);
+        };
+        let Some(target) = registry.schema_version_of(entity) else {
+            return Ok(None);
+        };
+        if entry.schema_version == target {
+            return Ok(None);
+        }
+
+        let migrated = migrations.migrate_value(
+            entity,
+            entry.command.payload.as_value(),
+            entry.schema_version,
+            target,
+        )?;
+
+        let payload = Payload::new(migrated).map_err(|e| MigrationError::Invalid {
+            entity: entity.clone(),
+            detail: e.to_string(),
+        })?;
+
+        Ok(Some(Command {
+            payload,
+            ..entry.command.clone()
         }))
     }
 

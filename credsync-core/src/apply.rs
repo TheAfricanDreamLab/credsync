@@ -331,6 +331,53 @@ pub(crate) fn stage_change<S: Storage>(
     Ok(())
 }
 
+/// Sets a row aside because it could not be migrated, without losing it.
+///
+/// The digest still moves as though the row had been applied, because it has been *received* — the
+/// device simply cannot read it. Leaving it out of the digest would report divergence against a
+/// server the client has not diverged from, and send it re-bootstrapping straight back into the
+/// same unreadable row.
+///
+/// The snapshot is stored exactly as it arrived. A later app version that knows the migration can
+/// then recover it, which is the only reason to keep it at all.
+pub(crate) fn stage_quarantine<S: Storage>(
+    storage: &S,
+    change: &Change,
+    digest: &mut ScopeDigest,
+    ops: &mut Vec<StorageOp>,
+    staged: &mut Staged,
+    reason: &str,
+) -> Result<(), ApplyError> {
+    let key = (change.entity.clone(), change.entity_id.clone());
+    let current = match staged.get(&key) {
+        Some(pending) => *pending,
+        None => storage.row_version(&change.entity, &change.entity_id)?,
+    };
+
+    let Some(snapshot) = change.snapshot.clone() else {
+        // A tombstone needs no migration: there is no document to migrate. Reaching here means the
+        // caller tried to quarantine a delete, which is a bug in the caller rather than bad data.
+        return Err(ApplyError::Inconsistent {
+            detail: "a tombstone cannot be quarantined",
+        });
+    };
+
+    match current {
+        Some(old) => digest.update(&change.entity, &change.entity_id, old, change.row_version),
+        None => digest.add(&change.entity, &change.entity_id, change.row_version),
+    }
+
+    ops.push(StorageOp::QuarantineRow {
+        entity: change.entity.clone(),
+        entity_id: change.entity_id.clone(),
+        snapshot,
+        schema_version: change.schema_version,
+        reason: reason.to_owned(),
+    });
+    staged.insert(key, Some(change.row_version));
+    Ok(())
+}
+
 /// Builds the divergence report for a scope whose digests disagree.
 pub(crate) fn divergence(batch: &Batch, client: &ScopeDigest) -> Telemetry {
     Telemetry::ScopeDiverged {
