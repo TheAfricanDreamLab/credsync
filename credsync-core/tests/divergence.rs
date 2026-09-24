@@ -42,6 +42,46 @@ where
     out
 }
 
+/// A bootstrap page, for driving the rebuild path.
+fn bootstrap_page(
+    seq: u64,
+    digest: credsync_protocol::HexString,
+    has_more: bool,
+) -> credsync_protocol::BootstrapResponse {
+    credsync_protocol::BootstrapResponse {
+        protocol: common::protocol(),
+        scope: common::scope(),
+        changes: vec![common::upsert(seq, &format!("r{seq}"), seq)],
+        next_cursor: credsync_protocol::Cursor::new(seq).expect("valid cursor"),
+        has_more,
+        checksum: common::hex("00000000000000000000000000000000"),
+        digest,
+    }
+}
+
+/// The digest a client holds after exactly one row.
+fn agreed_digest(_seq: u64, entity_id: &str, row_version: u64) -> credsync_protocol::HexString {
+    let mut d = credsync_protocol::ScopeDigest::EMPTY;
+    d.add(
+        &common::entity(),
+        &common::id(entity_id),
+        credsync_protocol::RowVersion::new(row_version).expect("valid row version"),
+    );
+    d.to_hex()
+}
+
+/// Drains and discards pending effects.
+fn drain<C, E, S, T, Z>(engine: &mut Engine<C, E, S, T, Z>)
+where
+    C: credsync_core::Clock,
+    E: credsync_core::Entropy,
+    S: credsync_core::Storage,
+    T: credsync_core::Transport,
+    Z: credsync_core::Compressor,
+{
+    while engine.next_effect().is_some() {}
+}
+
 // -------------------------------------------------------------------------------------------
 // DoD: telemetry carries BOTH digests
 // -------------------------------------------------------------------------------------------
@@ -246,39 +286,34 @@ fn a_tainted_scope_does_not_taint_the_others() {
 // DoD: repeated divergence escalates rather than looping
 // -------------------------------------------------------------------------------------------
 
-/// Diverging repeatedly stops the healing loop and raises a distinct signal.
+/// Rebuilds that keep failing stop the healing loop and raise a distinct signal.
+///
+/// Each round is a genuine **failed heal**: the scope is rebuilt and the rebuild's final page still
+/// disagrees. That is what the escalation counts — not the sync loop noticing the same unrepaired
+/// fault on successive pulls, which is one divergence however many times it is observed.
 ///
 /// A scope that diverges again immediately after being rebuilt from the server's own snapshot is
 /// not suffering a transient fault. Looping would hide that behind a device re-downloading the same
-/// scope forever, on a data budget the user is paying for.
+/// scope for ever, on a data budget the user is paying for.
 #[test]
-fn repeated_divergence_escalates_instead_of_looping() {
+fn repeated_failed_rebuilds_escalate_instead_of_looping() {
     let (mut engine, _storage) = common::new_engine();
 
-    for attempt in 1..=Engine::<
-        common::FakeClock,
-        common::FakeEntropy,
-        common::SharedStorage,
-        common::FakeTransport,
-        common::FakeCompressor,
-    >::MAX_HEAL_ATTEMPTS
-    {
+    for seq in 1..=3u64 {
+        engine.begin_rebootstrap(&common::scope()).ok();
         engine
-            .apply_batch(&common::batch_with_digest(
-                vec![common::upsert(u64::from(attempt), "r1", u64::from(attempt))],
-                wrong_digest(),
-            ))
+            .apply_bootstrap(&bootstrap_page(seq, wrong_digest(), false))
             .expect("applies");
     }
 
     let health = engine.scope_health(&common::scope());
     assert!(
         matches!(health, ScopeHealth::Unhealable { .. }),
-        "after repeated divergence the scope is still asking to be rebuilt: {health:?}"
+        "after three failed rebuilds the scope is still being healed: {health:?}"
     );
     assert!(
         !health.needs_rebootstrap(),
-        "an unhealable scope is still being offered for rebuild, which is the loop"
+        "an unhealable scope is still offered for rebuild, which is the loop"
     );
     assert!(
         engine.scopes_needing_rebootstrap().is_empty(),
@@ -360,5 +395,205 @@ fn a_long_catch_up_does_not_escalate_a_healthy_scope() {
         engine.scope_health(&common::scope()).attempts(),
         1,
         "a single catch-up counted as several divergences and burned the escalation budget"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// One divergence per trust episode
+// -------------------------------------------------------------------------------------------
+
+/// Pulling a tainted scope again does not count as a new divergence.
+///
+/// A tainted scope disagrees on **every** subsequent pull: the incremental digest is still wrong
+/// and stays wrong until it is rebuilt. Counting each of those reached the escalation threshold
+/// after three *pulls* and zero rebuilds — which is not what `Unhealable` means, and which the sync
+/// loop reaches simply by doing its job between the taint and the rebuild.
+///
+/// Found by review on #70.
+#[test]
+fn repeated_pulls_of_a_tainted_scope_count_as_one_divergence() {
+    let (mut engine, _storage) = common::new_engine();
+
+    for seq in 1..=4u64 {
+        engine
+            .apply_batch(&common::batch_with_digest(
+                vec![common::upsert(seq, &format!("r{seq}"), seq)],
+                wrong_digest(),
+            ))
+            .expect("applies");
+    }
+
+    assert_eq!(
+        engine.scope_health(&common::scope()).attempts(),
+        1,
+        "four pulls of one broken scope counted as four divergences, so the escalation budget is \
+         spent by the sync loop rather than by failed rebuilds"
+    );
+    assert!(
+        engine.scope_health(&common::scope()).needs_rebootstrap(),
+        "the scope stopped asking to be rebuilt without ever being rebuilt"
+    );
+}
+
+/// `ScopeUnhealable` is raised once, not on every subsequent pull.
+///
+/// It is the event that should reach a person. Re-emitting it on each pull would flood the channel
+/// it exists to be noticed in.
+#[test]
+fn escalation_is_reported_once_not_on_every_pull() {
+    let (mut engine, _storage) = common::new_engine();
+
+    // Three failed heals: each divergence is on the final page of a rebuild.
+    for seq in 1..=3u64 {
+        engine.begin_rebootstrap(&common::scope()).ok();
+        engine
+            .apply_bootstrap(&bootstrap_page(seq, wrong_digest(), false))
+            .expect("applies");
+    }
+    assert!(matches!(
+        engine.scope_health(&common::scope()),
+        ScopeHealth::Unhealable { .. }
+    ));
+    drain(&mut engine);
+
+    // Further ordinary pulls must stay quiet.
+    for seq in 4..=6u64 {
+        engine
+            .apply_batch(&common::batch_with_digest(
+                vec![common::upsert(seq, &format!("r{seq}"), seq)],
+                wrong_digest(),
+            ))
+            .expect("applies");
+    }
+
+    let repeats = effects(&mut engine)
+        .into_iter()
+        .filter(|e| matches!(e, Effect::Emit(Telemetry::ScopeUnhealable { .. })))
+        .count();
+    assert_eq!(
+        repeats, 0,
+        "an already-escalated scope raised the alert again on every pull"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// A healed scope stays healed across a restart
+// -------------------------------------------------------------------------------------------
+
+/// A rebuild that agreed is remembered, so a restart does not rebuild it again.
+///
+/// Held only in memory, the heal was lost on restart and `restore_scope_health` read the stored
+/// count as `Tainted` — so the sync loop cleared and re-downloaded a perfectly healthy scope on
+/// every launch, for the life of the install. The same loop the count exists to prevent, moved
+/// from the escalation path to the heal path.
+///
+/// Found by review on #70, which also noted that
+/// `a_scope_that_cannot_be_healed_stops_being_rebuilt` could not catch it — that test *depends* on
+/// the restart turning the scope back into `Tainted`.
+#[test]
+fn a_healed_scope_is_still_healed_after_a_restart() {
+    let (mut engine, storage) = common::new_engine();
+
+    engine
+        .apply_batch(&common::batch_with_digest(
+            vec![common::upsert(1, "r1", 1)],
+            wrong_digest(),
+        ))
+        .expect("applies");
+    assert!(engine.scope_health(&common::scope()).needs_rebootstrap());
+
+    engine
+        .begin_rebootstrap(&common::scope())
+        .expect("rebuilds");
+    engine
+        .apply_bootstrap(&bootstrap_page(1, agreed_digest(1, "r1", 1), false))
+        .expect("applies");
+    assert!(engine.scope_health(&common::scope()).is_healthy());
+
+    // The stored record says healed, so a restart does not re-taint it.
+    let (attempts, healed) = storage
+        .with(|s| s.divergences.get(&common::scope()).copied())
+        .expect("a divergence record");
+    assert!(healed, "the heal was never written down");
+
+    let (mut restarted, _) = common::new_engine();
+    restarted.restore_scope_health(common::scope(), attempts, healed);
+
+    assert!(
+        restarted.scope_health(&common::scope()).is_healthy(),
+        "a healed scope came back tainted after a restart"
+    );
+    assert!(
+        restarted.scopes_needing_rebootstrap().is_empty(),
+        "a healthy scope would be cleared and re-downloaded on every launch"
+    );
+    assert_eq!(
+        restarted.scope_health(&common::scope()).attempts(),
+        attempts,
+        "the history was forgotten, so a scope that breaks again starts its count over"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// clear_scope_health
+// -------------------------------------------------------------------------------------------
+
+/// Clearing forgets the history, durably.
+#[test]
+fn clearing_scope_health_forgets_the_history() {
+    let (mut engine, storage) = common::new_engine();
+    engine
+        .apply_batch(&common::batch_with_digest(
+            vec![common::upsert(1, "r1", 1)],
+            wrong_digest(),
+        ))
+        .expect("applies");
+    assert_eq!(engine.scope_health(&common::scope()).attempts(), 1);
+
+    engine.clear_scope_health(&common::scope()).expect("clears");
+
+    assert!(engine.scope_health(&common::scope()).is_healthy());
+    assert_eq!(engine.scope_health(&common::scope()).attempts(), 0);
+    assert_eq!(
+        storage.with(|s| s.divergences.get(&common::scope()).copied()),
+        Some((0, false)),
+        "the cleared count was not written down, so a restart would bring the history back"
+    );
+}
+
+/// A failed write leaves the history exactly as it was.
+///
+/// Reporting a clear that did not commit would have the host believe a scope had been forgiven
+/// while storage still says otherwise — and the next restart would contradict the UI.
+#[test]
+fn a_failed_clear_leaves_the_history_unchanged() {
+    let (mut engine, storage) = common::new_engine();
+    engine
+        .apply_batch(&common::batch_with_digest(
+            vec![common::upsert(1, "r1", 1)],
+            wrong_digest(),
+        ))
+        .expect("applies");
+    let before = storage.with(|s| s.divergences.get(&common::scope()).copied());
+
+    storage.with_mut(|s| {
+        s.fail_next = Some(credsync_core::StorageError::Transient {
+            detail: "disk full".to_owned(),
+        });
+    });
+
+    engine
+        .clear_scope_health(&common::scope())
+        .expect_err("the clear must fail when the write fails");
+
+    assert_eq!(
+        engine.scope_health(&common::scope()).attempts(),
+        1,
+        "the history was forgotten in memory despite the write failing"
+    );
+    assert_eq!(
+        storage.with(|s| s.divergences.get(&common::scope()).copied()),
+        before,
+        "a failed clear changed what storage holds"
     );
 }

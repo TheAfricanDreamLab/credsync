@@ -119,6 +119,13 @@ pub enum StorageOp {
         scope: ScopeId,
         /// How many times it has now diverged.
         attempts: u32,
+        /// Whether a rebuild has since agreed.
+        ///
+        /// The count alone cannot tell "broken, rebuild it" from "was broken, rebuilt, fine now".
+        /// Without this flag a restart reads a healed scope as tainted and clears and re-downloads
+        /// it on every launch for the life of the install — the loop the count exists to prevent,
+        /// moved from the escalation path to the heal path.
+        healed: bool,
     },
 
     /// Drop every row of a scope, for a re-bootstrap after divergence. `docs/spec.md` §5.

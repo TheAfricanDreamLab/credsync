@@ -201,7 +201,7 @@ where
         //
         // This is the same rule `apply_bootstrap` already follows for its pages, arrived at from
         // the other direction.
-        self.apply_changes(batch, !batch.has_more)
+        self.apply_changes(batch, !batch.has_more, false)
     }
 
     /// Applies one page of a bootstrap. `docs/spec.md` §3.1.
@@ -232,7 +232,10 @@ where
             checksum: response.checksum.clone(),
             digest: response.digest.clone(),
         };
-        self.apply_changes(&batch, !response.has_more)
+        // `rebuilding`: a bootstrap page *is* the rebuild, so a divergence on its final page is a
+        // heal that failed, which is what the escalation counts. A divergence on an ordinary pull
+        // of an already-tainted scope is the same fault observed again, and must not count.
+        self.apply_changes(&batch, !response.has_more, true)
     }
 
     /// The shared body of [`apply_batch`](Self::apply_batch) and
@@ -243,6 +246,7 @@ where
         &mut self,
         batch: &Batch,
         compare_digest: bool,
+        rebuilding: bool,
     ) -> Result<Applied, ApplyError> {
         let state = self.scopes.get(&batch.scope).copied().unwrap_or_default();
 
@@ -325,15 +329,41 @@ where
         // its cursor while forgetting that the scope is broken — carrying on against a base it had
         // already decided not to trust. It also keeps one apply to one transaction, which the
         // adapter tests assert directly.
+        let health = self.scope_health(&batch.scope);
         let diverged = compare_digest && digest.to_hex() != batch.digest;
-        let escalated = diverged.then(|| {
-            let attempts = self.scope_health(&batch.scope).attempts().saturating_add(1);
+
+        // **One divergence per trust episode, not one per pull.**
+        //
+        // A tainted scope disagrees on every subsequent pull: the incremental digest is still
+        // wrong and stays wrong until it is rebuilt. Counting each of those reached the escalation
+        // threshold after three *pulls* and zero rebuilds — which contradicts what `Unhealable`
+        // says it means — and then re-emitted `ScopeUnhealable` on every pull thereafter, flooding
+        // the one signal that is meant to reach a person.
+        //
+        // So a divergence counts when the scope was trusted, or when it is the final page of a
+        // rebuild. That second case is a heal that failed, which is exactly what is being counted.
+        let counts =
+            diverged && (health.is_healthy() || (rebuilding && health.needs_rebootstrap()));
+        let escalated = counts.then(|| {
+            let attempts = health.attempts().saturating_add(1);
             ops.push(StorageOp::RecordDivergence {
                 scope: batch.scope.clone(),
                 attempts,
+                healed: false,
             });
             attempts
         });
+
+        // A rebuild that agrees, recorded durably in the same transaction. Held only in memory, a
+        // restart would read the scope as tainted and clear and re-download it on every launch.
+        let heals = compare_digest && !diverged && health.needs_rebootstrap();
+        if heals {
+            ops.push(StorageOp::RecordDivergence {
+                scope: batch.scope.clone(),
+                attempts: health.attempts(),
+                healed: true,
+            });
+        }
 
         let outcome = self.storage.transact(&ops)?;
         debug_assert_eq!(
@@ -365,21 +395,17 @@ where
         if let Some(attempts) = escalated {
             self.emit(Effect::Emit(apply::divergence(batch, &digest)));
             self.taint(&batch.scope, attempts);
-        } else if compare_digest {
-            // The scope agrees again, so it no longer needs rebuilding — but the *count* stays.
-            // A scope that diverges, heals, and diverges again is the repeated divergence the
-            // escalation exists for, and forgetting on each apparent success would let that run
-            // for ever. `clear_scope_health` is how a host that has investigated forgets it.
-            if let Some(health) = self.health.get(&batch.scope).copied()
-                && health.needs_rebootstrap()
-            {
-                self.health.insert(
-                    batch.scope.clone(),
-                    ScopeHealth::Healed {
-                        attempts: health.attempts(),
-                    },
-                );
-            }
+        } else if heals {
+            // Agrees again, so it no longer needs rebuilding — but the *count* stays. A scope that
+            // diverges, heals and diverges again is the repeated divergence being counted, and
+            // forgetting on each apparent success would let that run for ever.
+            // `clear_scope_health` is how a host that has investigated forgets it.
+            self.health.insert(
+                batch.scope.clone(),
+                ScopeHealth::Healed {
+                    attempts: health.attempts(),
+                },
+            );
         }
 
         Ok(Applied {
@@ -535,6 +561,7 @@ where
         self.storage.transact(&[StorageOp::RecordDivergence {
             scope: scope.clone(),
             attempts: 0,
+            healed: false,
         }])?;
         self.health.remove(scope);
         Ok(())
@@ -544,12 +571,16 @@ where
     ///
     /// Without this the escalation counts only the divergences seen since
     /// the process started, and a crash-looping device would rebuild the same scope forever.
-    pub fn restore_scope_health(&mut self, scope: ScopeId, attempts: u32) {
+    pub fn restore_scope_health(&mut self, scope: ScopeId, attempts: u32, healed: bool) {
         if attempts == 0 {
             self.health.remove(&scope);
             return;
         }
-        let health = if attempts >= Self::MAX_HEAL_ATTEMPTS {
+        let health = if healed {
+            // Was broken, rebuilt, fine now. Syncs normally, and keeps the history so a scope that
+            // breaks again is counted rather than starting over.
+            ScopeHealth::Healed { attempts }
+        } else if attempts >= Self::MAX_HEAL_ATTEMPTS {
             ScopeHealth::Unhealable { attempts }
         } else {
             ScopeHealth::Tainted { attempts }
