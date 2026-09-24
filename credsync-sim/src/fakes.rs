@@ -176,7 +176,7 @@ pub struct Db {
     /// knows the migration can recover it — which is the only reason to keep it.
     pub quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
     /// How many times each scope has diverged, so escalation survives a restart.
-    pub divergences: BTreeMap<ScopeId, u32>,
+    pub divergences: BTreeMap<ScopeId, (u32, bool)>,
     /// Every command id this device has ever enqueued.
     ///
     /// The outbox drains and `resolved` only grows for commands that got an answer, so neither
@@ -291,8 +291,12 @@ impl Db {
                     next.outbox.retain(|(c, _)| c.id != *id);
                     next.resolved.push((*id, resolution.clone()));
                 }
-                StorageOp::RecordDivergence { scope, attempts } => {
-                    next.divergences.insert(scope.clone(), *attempts);
+                StorageOp::RecordDivergence {
+                    scope,
+                    attempts,
+                    healed,
+                } => {
+                    next.divergences.insert(scope.clone(), (*attempts, *healed));
                 }
                 StorageOp::ClearScope { scope, entities } => {
                     // Rows, cursor and digest. The outbox survives: those commands have not

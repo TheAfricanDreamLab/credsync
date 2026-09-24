@@ -82,19 +82,19 @@ fn server_with(rows: usize) -> Server {
 /// about a set of rows the device no longer has.
 fn restart_recomputing(storage: &SimStorage) -> SimEngine {
     let mut engine = device(storage.clone());
-    let (cursor, digest, attempts) = {
+    let (cursor, digest, (attempts, healed)) = {
         let db = storage.0.borrow();
         let cursor = db.cursors.get(&scope()).copied().unwrap_or(Cursor::START);
         (
             cursor,
             db.digest_over_rows(&scope(), &[entity()]),
-            db.divergences.get(&scope()).copied().unwrap_or(0),
+            db.divergences.get(&scope()).copied().unwrap_or((0, false)),
         )
     };
     engine.restore_scope(scope(), credsync_core::ScopeState::restored(cursor, digest));
     // Carried across the restart on purpose. Without it the escalation counts only what this
     // process has seen, and a crash-looping device rebuilds the same scope forever.
-    engine.restore_scope_health(scope(), attempts);
+    engine.restore_scope_health(scope(), attempts, healed);
     engine
 }
 

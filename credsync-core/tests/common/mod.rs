@@ -58,7 +58,7 @@ pub struct FakeStorage {
     /// Rows set aside because they could not be migrated, with the bytes exactly as they arrived.
     pub quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
     /// How many times each scope has diverged, so escalation survives a restart.
-    pub divergences: BTreeMap<ScopeId, u32>,
+    pub divergences: BTreeMap<ScopeId, (u32, bool)>,
 }
 
 impl FakeStorage {
@@ -175,8 +175,12 @@ impl FakeStorage {
                     s.recovered
                         .push((*command_id, entity.clone(), payload.clone()));
                 }
-                StorageOp::RecordDivergence { scope, attempts } => {
-                    s.divergences.insert(scope.clone(), *attempts);
+                StorageOp::RecordDivergence {
+                    scope,
+                    attempts,
+                    healed,
+                } => {
+                    s.divergences.insert(scope.clone(), (*attempts, *healed));
                 }
                 StorageOp::ClearScope { scope, entities } => {
                     // Rows only. The outbox belongs to the write path and survives a rebuild of
@@ -221,7 +225,7 @@ pub struct Snapshotted {
     resolved: Vec<(CommandId, credsync_core::Resolution)>,
     recovered: Vec<(CommandId, EntityName, Payload)>,
     quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
-    divergences: BTreeMap<ScopeId, u32>,
+    divergences: BTreeMap<ScopeId, (u32, bool)>,
 }
 
 impl Storage for FakeStorage {
