@@ -104,6 +104,15 @@ Pick the weakest tool that actually proves the claim:
 - **Never assert a property you have not seen fail.** When adding an invariant, break the code
   deliberately once and confirm the invariant catches it. An invariant that has never failed is
   an untested invariant.
+- **Write the test from the rule, not from the code you just wrote.** A test written by reading
+  the implementation agrees with whatever that implementation does, including its bugs — and then
+  *blocks* the fix, because correcting the code makes the test fail. Two CS-22 tests did exactly
+  this and both were caught by review rather than by the suite: one asserted escalation after three
+  plain pulls, which only passed because escalation was wrongly counting pulls instead of failed
+  rebuilds; the other could not detect an unpersisted heal because it *depended* on a restart
+  re-tainting the scope. The planted-bug drill above does not catch this class — a drill breaks the
+  code and checks the test notices, which a test derived from that same code will happily do.
+  State what the behaviour should be, then see whether the code agrees.
 - **Adapters prove themselves against the conformance suite**, not against bespoke tests. Any
   port that passes conformance is correct by construction; that is the whole contract.
 
