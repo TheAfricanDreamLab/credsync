@@ -174,6 +174,46 @@ jobs:
           PROPTEST_CASES: "2"
         run: cargo +nightly miri test -p credsync-core -p credsync-protocol
 
+  fuzz-smoke:
+    name: fuzz, smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz needs nightly for -Zsanitizer. Same reasoning as the miri job: D-021 pins the
+      # toolchain the code is *built* with, and a checker is not a build target.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Every wire-facing decoder has a target, checked by derivation rather than by a list that
+      # somebody has to remember to update. It found four decoders the hand-written list had
+      # missed on the day it was written.
+      - name: every decoder is fuzzed
+        run: ./scripts/check-fuzz-coverage.sh
+
+      # Twenty seconds each, not the sixty the slice plan suggests. Eighteen targets at sixty is
+      # eighteen minutes on every pull request, and a gate people route around because it is slow
+      # is worse than a shorter one they keep. Depth lives in the nightly job, which runs fifteen
+      # minutes per target against the same committed corpus.
+      #
+      # The smoke run's job is narrower and still worth having: catch a decoder that panics on
+      # something shallow, on the commit that introduced it rather than the next morning.
+      - name: fuzz every decoder
+        run: ./scripts/fuzz.sh 20
+
+      # The corpus is the accumulated coverage. A crash artifact is the bug report - it reproduces
+      # with `cargo +nightly fuzz run <target> <file>` - so it is kept even when the job fails.
+      - name: keep crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: credsync-protocol/fuzz/artifacts/
+          if-no-files-found: ignore
+
   deny:
     name: licences and advisories
     runs-on: ubuntu-latest

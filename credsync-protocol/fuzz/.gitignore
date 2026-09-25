@@ -1,0 +1,15 @@
+# Build output and coverage data: regenerated, large, machine-specific.
+target
+coverage
+
+# Crash artifacts are NOT ignored on purpose.
+#
+# An artifact is the reproduction for a bug, and CS-29 requires it to become an issue carrying that
+# input. Ignoring the directory would make the one file worth keeping the easiest one to lose.
+# It stays empty in a healthy repo, which is the point.
+
+# `corpus` is NOT ignored either, though `cargo fuzz init` ignores it by default.
+#
+# Coverage accumulates across runs only if the inputs survive them. What is committed is a *seed*
+# corpus -- the golden fixtures, one or two per target -- not the thousands of units a single
+# session generates. See fuzz/README.md.
