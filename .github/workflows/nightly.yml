@@ -42,9 +42,24 @@ jobs:
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      # Fifteen minutes per target, against the committed corpus. The corpus is why this gets
-      # better over time rather than re-deriving the same shallow inputs every night: each run
-      # starts from everything previous runs found interesting.
+      # Last night's corpus, restored before fuzzing.
+      #
+      # Without this the job starts from the committed seeds every time, so "each run starts from
+      # everything previous runs found interesting" would simply not be true -- it would rediscover
+      # the same shallow inputs nightly and the deep coverage would never compound. Caught in
+      # review on #73, where the claim was in the comment and the restore was not in the job.
+      #
+      # `restore-keys` makes the most recent previous corpus the fallback, so a run still starts
+      # warm on the first night after this lands, and after any week where nothing changed.
+      - name: restore last night's corpus
+        uses: actions/cache@v4
+        with:
+          path: credsync-protocol/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      # Fifteen minutes per target, against the committed seeds plus whatever earlier runs found.
       - name: fuzz every decoder, deeply
         run: ./scripts/fuzz.sh 900
 

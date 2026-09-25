@@ -24,22 +24,37 @@ TARGETS=credsync-protocol/fuzz/fuzz_targets
 # `Document` is excluded by name: it is generic over its limit and is never decoded as itself. Its
 # two instantiations, Snapshot and Payload, have targets of their own and are what actually appear
 # on the wire.
+# The derive attribute is accumulated across lines, not read as one.
+#
+# rustfmt wraps a `#[derive(...)]` that exceeds max_width, which puts `Deserialize` on a
+# continuation line. A single-line match would not see it, the type would look like it was never
+# wire-facing, and this gate would quietly stop covering it -- the exact failure it exists to
+# prevent, caused by reformatting. Caught in review on #73.
 decoders=$(
   awk '
-    /^#\[derive\(/ { d = $0 }
+    # An attribute begins, and may continue over several lines until its brackets close.
+    /^#\[/ { attr = attr " " $0; in_attr = ($0 !~ /\]$/); next }
+    # A continuation line of a wrapped attribute. `)]` starts at column zero, so this cannot key
+    # on indentation alone.
+    in_attr { attr = attr " " $0; if ($0 ~ /\]$/) in_attr = 0; next }
     /^pub (struct|enum) / {
-      if (d ~ /Deserialize/) {
+      if (attr ~ /Deserialize/) {
         name = $3
         sub(/[<({].*/, "", name)
         if (name != "Document") print name
       }
-      d = ""
+      attr = ""
+      next
     }
+    # A blank line separates items, so anything accumulated belonged to the previous one.
+    /^[[:space:]]*$/ { attr = "" }
   ' "$WIRE" | sort -u
 )
 
-# Snapshot and Payload are type aliases rather than declarations, so they are named here. They are
-# still checked like the rest: a missing target fails the same way.
+# Snapshot and Payload are type *aliases* for `Document<..>`, so they are declarations the scan
+# above cannot see. Named here, and checked exactly like the rest: a missing target fails the same
+# way. `Document` itself is excluded because it is generic over its limit and never decoded as
+# itself -- only these two instantiations appear on the wire.
 decoders=$(printf '%s\nSnapshot\nPayload\n' "$decoders" | sort -u)
 
 missing=0
@@ -54,12 +69,33 @@ for ty in $decoders; do
   fi
 done
 
+# The check runs both ways.
+#
+# Checking only "every decoder has a target" passes when the parser finds *no* decoders, which is
+# the one failure that matters: a gate that silently stops looking reports success for ever.
+# Measured during review on #73 -- a wrapped derive made the scan miss a type, the count dropped
+# from 18 to 17, and the script still said "ok".
+#
+# A target with no matching decoder therefore fails too. It means either the parser broke, or a
+# wire type was removed and its target should go with it; both want a person to look.
+for f in "$TARGETS"/*.rs; do
+  target=$(basename "$f" .rs)
+  [ "$target" = "_shared" ] && continue
+  expected=$(echo "$target" | awk -F_ '{ for (i=1;i<=NF;i++) printf "%s%s", toupper(substr($i,1,1)), substr($i,2); print "" }')
+  if ! echo "$decoders" | grep -qx "$expected"; then
+    echo "  ORPHAN   $target.rs -> no '$expected' found in $WIRE"
+    missing=1
+  fi
+done
+
 echo "  $count wire-facing decoder(s) checked"
 if [ "$missing" -ne 0 ]; then
   echo
-  echo "FAIL: a type reachable from the network has no fuzz target." >&2
-  echo "A new decoder is the least exercised code in the crate, which is when fuzzing it" >&2
-  echo "matters most. Add the target rather than adding an exception here." >&2
+  echo "FAIL: the fuzz targets and the wire types disagree." >&2
+  echo "A MISSING line means a type reachable from the network has no target: add it, rather" >&2
+  echo "than adding an exception here -- a new decoder is the least exercised code in the crate." >&2
+  echo "An ORPHAN line means this script could not find a type one of its targets names, which" >&2
+  echo "usually means the scan broke rather than that the type went away." >&2
   exit 1
 fi
-echo "  ok    every wire-facing decoder is fuzzed"
+echo "  ok    every wire-facing decoder is fuzzed, and every target names a real one"

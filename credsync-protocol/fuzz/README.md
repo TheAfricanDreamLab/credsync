@@ -34,7 +34,11 @@ arriving through the front door, and checking only "does not panic" would miss a
 
 The artifact **is** the bug report.
 
+`cargo fuzz` must run from the crate being fuzzed, not the repository root — `scripts/fuzz.sh`
+changes directory for you, this does not:
+
 ```sh
+cd credsync-protocol
 cargo +nightly fuzz run batch fuzz/artifacts/batch/crash-<hash>
 ```
 
@@ -51,8 +55,15 @@ cargo +nightly fuzz run batch fuzz/artifacts/batch/crash-<hash>
 Coverage accumulates across runs only if the inputs survive them. What is committed is a **seed**
 corpus — the golden fixtures from `tests/fixtures/`, one or two per target — not the thousands of
 units a single session generates. Seeds are chosen for meaning; volume is the nightly job's
-business, and its grown corpus is uploaded as an artifact for a person to look at rather than
-pushed automatically. A corpus that grows unattended becomes a slow checkout for everybody.
+business. That job caches its corpus between runs, so coverage compounds night over night without
+any of it landing in the repository, and uploads the grown corpus as an artifact for a person to
+look at. A corpus that grows unattended becomes a slow checkout for everybody — one twenty-second
+session across all eighteen targets produced 76 MB.
+
+Enum targets get **one seed per variant**, not one file listing them all. The golden fixtures store
+enums as arrays (`["upsert","delete"]`), which cannot decode as a single `Op` — so a seed copied
+straight from the fixture only ever reached the rejection branch. Measured on `op`: 76 coverage
+points from the array, 83 from per-variant seeds.
 
 ## Adding a wire type
 
