@@ -154,6 +154,9 @@ async fn try_migrate(client: &Client) -> Attempt {
             .await?;
         client
             .batch_execute(include_str!("../migrations/0002_scope_blocklist.sql"))
+            .await?;
+        client
+            .batch_execute(include_str!("../migrations/0003_watermark.sql"))
             .await
     }
     .await;
@@ -194,6 +197,172 @@ async fn reset_lock_timeout(client: &Client) {
     let _ = client.batch_execute("SET lock_timeout = DEFAULT").await;
 }
 
+/// The advisory-lock key that separates change-log writers from a reader establishing a watermark.
+///
+/// Arbitrary but stable, and distinct from [`MIGRATION_LOCK`]: two locks that shared a key would
+/// serialise against each other for no reason, and the bug would look like a mysterious stall.
+const WRITER_LOCK: i64 = 0x0000_c2ed_5900_0002;
+
+/// Takes the writer side of the change-log lock, for the duration of the calling transaction.
+///
+/// **A host must call this in the transaction that writes its change-log rows**, before the first
+/// `INSERT`. It is a *shared* lock, so writers never block each other; the only thing it blocks is
+/// a reader trying to establish a watermark, and only for as long as the write takes.
+///
+/// # Why a host has to do anything at all
+///
+/// Because the ordering problem cannot be solved from the read side. See [`safe_watermark`]: `seq`
+/// is allocated at `INSERT` and a row becomes visible at `COMMIT`, and nothing visible to a reader
+/// reveals which `seq` values are currently allocated-but-uncommitted. The writer is the only party
+/// that knows, and this is the cheapest way for it to say so.
+///
+/// Released automatically at commit or rollback, because it is transaction-scoped. There is no way
+/// for a host to leak it.
+///
+/// # Errors
+/// Returns [`ServerError::Database`] if the lock cannot be taken.
+#[cfg(feature = "postgres")]
+pub async fn lock_for_write(client: &Client) -> Result<(), ServerError> {
+    client
+        .execute("SELECT pg_advisory_xact_lock_shared($1)", &[&WRITER_LOCK])
+        .await?;
+    Ok(())
+}
+
+/// How long a reader will wait for in-flight change-log writes before serving slightly stale data.
+///
+/// Short on purpose. Waiting longer buys fresher data and costs latency on every pull; falling back
+/// costs one cycle of staleness and nothing else, because the fallback watermark is still safe.
+const WATERMARK_LOCK_TIMEOUT_MS: u32 = 250;
+
+/// The highest `seq` that is certainly committed, and therefore safe to deliver up to.
+///
+/// # Why a watermark, and why the previous guard was wrong
+///
+/// `seq` is a `bigserial`, allocated when the `INSERT` runs; a row becomes visible when its
+/// transaction commits. Those two orders differ, so a client handed a later `seq` while an earlier
+/// one is still in flight would advance its cursor past a change it will never be given.
+///
+/// D-063 guarded that with `xmin < pg_snapshot_xmin(...)` — deliver only rows whose transaction
+/// finished before the oldest running one began. **That does not work**, because it assumes xid
+/// order bounds `seq` order and it does not: an xid is assigned at a transaction's *first write*,
+/// a `seq` at its `INSERT` into `sync_changes`, and those are independent.
+///
+/// ```text
+///   T0: BEGIN; INSERT elsewhere        -> takes xid 837
+///   T1: BEGIN; INSERT sync_changes     -> takes xid 838, seq 102   (stays open)
+///   T0:        INSERT sync_changes     -> seq 103; COMMIT
+///
+///   pg_snapshot_xmin is now 838. Row 103 has xmin 837 < 838, so it was admitted —
+///   while 102 sat uncommitted underneath it.
+/// ```
+///
+/// That shape is not exotic. A host writing domain state before its change-log row takes its xid
+/// early and its `seq` late, which is exactly what `docs/spec.md` §1 prescribes: *"written by
+/// domain handlers via the outbox in the same transaction as the state change"*. Measured and filed
+/// as #74.
+///
+/// # How this one works
+///
+/// Writers hold [`lock_for_write`] — a *shared* advisory lock — for the length of their
+/// transaction. Taking it **exclusively** therefore waits until no change-log write is in flight,
+/// and at that instant every `seq` the sequence has handed out has committed. The sequence's
+/// `last_value` read at that moment is a watermark with no hole beneath it, and it is recorded.
+///
+/// # A reader is never blocked
+///
+/// The exclusive attempt is bounded by a short lock timeout. If a writer is holding a long
+/// transaction, the reader gives up and serves the **last recorded watermark** instead.
+///
+/// That is always safe: a watermark established at a quiescent instant means every `seq` at or
+/// below it had committed, and committed rows stay committed. An older watermark is therefore
+/// never *wrong*, only staler — which is the right way round. The first version of this waited
+/// unconditionally and deadlocked the test suite against a writer holding a transaction open, which
+/// would have traded a staleness bug for a hard stall.
+///
+/// # What it costs
+///
+/// Staleness bounded by how long writers keep the lock continuously held, and nothing else. A
+/// `pg_dump`, a long analytics query, or a leaked idle-in-transaction connection that never touches
+/// `sync_changes` now has no effect at all — which was #62.
+///
+/// A host that forgets to call [`lock_for_write`] does not corrupt anything; it reintroduces the
+/// race for its own writes, which is why [`append_change`] calls it for the writes it performs.
+///
+/// # Errors
+/// Returns [`ServerError::Database`] if the watermark can neither be established nor read back.
+#[cfg(feature = "postgres")]
+pub async fn safe_watermark(client: &Client) -> Result<i64, ServerError> {
+    // An explicit transaction, because `pg_advisory_xact_lock` is released when it ends and the
+    // read of `last_value` must happen while the lock is still held. In one implicit statement the
+    // lock would already be gone.
+    client.batch_execute("BEGIN").await?;
+
+    let established = establish_watermark(client).await;
+
+    // Committed either way: on the happy path it persists the new watermark, and on the timeout
+    // path there is nothing to persist but the transaction still has to end.
+    let closed = client.batch_execute("COMMIT").await;
+
+    match established {
+        Ok(Some(watermark)) => {
+            closed?;
+            Ok(watermark)
+        }
+        Ok(None) | Err(_) => {
+            // Either a writer held the lock past the timeout, or the attempt failed outright.
+            // Both fall back to the last watermark somebody did establish, which is stale rather
+            // than wrong. A failure to read *that* is a real error.
+            let _ = closed;
+            let _ = client.batch_execute("ROLLBACK").await;
+            recorded_watermark(client).await
+        }
+    }
+}
+
+/// Takes the lock, reads the sequence, and records the result. `Ok(None)` means a writer held it.
+#[cfg(feature = "postgres")]
+async fn establish_watermark(client: &Client) -> Result<Option<i64>, tokio_postgres::Error> {
+    client
+        .batch_execute(&format!(
+            "SET LOCAL lock_timeout = {WATERMARK_LOCK_TIMEOUT_MS}"
+        ))
+        .await?;
+
+    if let Err(e) = client
+        .execute("SELECT pg_advisory_xact_lock($1)", &[&WRITER_LOCK])
+        .await
+    {
+        if e.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) {
+            return Ok(None);
+        }
+        return Err(e);
+    }
+
+    // Read *after* the lock is granted. Reading it first would give a number a writer could still
+    // be below, which is the whole bug this function exists to avoid.
+    let row = client
+        .query_one(
+            "INSERT INTO sync_watermark (only_row, value)
+             VALUES (true, COALESCE((SELECT last_value FROM sync_changes_seq_seq WHERE is_called), 0))
+             ON CONFLICT (only_row)
+             DO UPDATE SET value = GREATEST(sync_watermark.value, EXCLUDED.value)
+             RETURNING value",
+            &[],
+        )
+        .await?;
+    Ok(Some(row.get::<_, i64>("value")))
+}
+
+/// The last watermark anybody managed to establish.
+#[cfg(feature = "postgres")]
+async fn recorded_watermark(client: &Client) -> Result<i64, ServerError> {
+    let rows = client
+        .query("SELECT value FROM sync_watermark WHERE only_row", &[])
+        .await?;
+    Ok(rows.first().map_or(0, |r| r.get::<_, i64>("value")))
+}
+
 /// One page of changes, and whether the row ceiling cut it short.
 #[derive(Debug, Clone)]
 pub struct Page {
@@ -216,11 +385,10 @@ pub struct Page {
 /// into memory before the budget is even measured. One extra row is read beyond the ceiling so
 /// [`Page::more_beyond`] can be answered without a second query.
 ///
-/// # Why the snapshot guard, and not just `seq > cursor`
+/// # Why the watermark, and not just `seq > cursor`
 ///
-/// `seq` is a `bigserial`, which allocates when the `INSERT` runs — but a row becomes **visible**
-/// when its transaction commits, and those two orders are not the same. Demonstrated against
-/// Postgres 14:
+/// `seq` is a `bigserial`, allocated when the `INSERT` runs — but a row becomes **visible** when its
+/// transaction commits, and those two orders are not the same:
 ///
 /// ```text
 ///   A: BEGIN; INSERT -> seq 1; (still open)
@@ -232,12 +400,10 @@ pub struct Page {
 /// silent loss of exactly the kind this project exists to prevent, invisible to every ordering
 /// check because the batch it received was perfectly ordered.
 ///
-/// So the query returns only rows whose inserting transaction finished before the oldest
-/// currently-running one began. A row from a transaction that might still be in flight is
-/// withheld, not reordered: the client simply gets it on the next pull, a moment later.
-///
-/// The cost is latency, bounded by how long the slowest concurrent writer holds its transaction
-/// open. The alternative is losing writes, so it is not much of a trade.
+/// [`safe_watermark`] is where that is prevented, and its docs explain why the previous guard
+/// (`xmin < pg_snapshot_xmin`) did not: xid order does not bound `seq` order, so the old guard
+/// admitted exactly the row it existed to withhold (#74). Rows above the watermark are withheld,
+/// not reordered — the client gets them on the next pull, a moment later.
 ///
 /// # The scope filter is not optional and not a convenience
 ///
@@ -254,6 +420,26 @@ pub async fn changes_after(
     cursor: u64,
     limit: i64,
 ) -> Result<Page, ServerError> {
+    let watermark = safe_watermark(client).await?;
+    changes_after_watermark(client, scope, cursor, limit, watermark).await
+}
+
+/// [`changes_after`] against a watermark the caller already established.
+///
+/// Serving several scopes in one pull should establish the watermark once, not once per scope: the
+/// numbers would differ, so the batches would describe different instants, and a client applying
+/// them would hold a mixture no single server state ever matched.
+///
+/// # Errors
+/// As [`changes_after`].
+#[cfg(feature = "postgres")]
+pub async fn changes_after_watermark(
+    client: &Client,
+    scope: &ScopeId,
+    cursor: u64,
+    limit: i64,
+    watermark: i64,
+) -> Result<Page, ServerError> {
     let cursor = i64::try_from(cursor).map_err(|_| ServerError::Corrupt {
         detail: format!("cursor {cursor} does not fit a bigint"),
     })?;
@@ -264,10 +450,10 @@ pub async fn changes_after(
                FROM sync_changes
               WHERE scope = $1
                 AND seq > $2
-                AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+                AND seq <= $3
               ORDER BY seq ASC
-              LIMIT $3",
-            &[&scope.as_str(), &cursor, &(limit + 1)],
+              LIMIT $4",
+            &[&scope.as_str(), &cursor, &watermark, &(limit + 1)],
         )
         .await?;
 
@@ -329,6 +515,13 @@ pub struct NewChange<'a> {
 /// Returns [`ServerError::Database`] if the insert fails, including when a check constraint
 /// refuses the row — an upsert with no snapshot, or a delete carrying one.
 pub async fn append_change(client: &Client, change: &NewChange<'_>) -> Result<i64, ServerError> {
+    // The writer side of the ordering contract. See `safe_watermark` for what it buys and #74 for
+    // what happened without it.
+    //
+    // A host writing its own change-log rows in its own transaction must call `lock_for_write`
+    // itself, before its first INSERT -- this function can only speak for the writes it performs.
+    lock_for_write(client).await?;
+
     let row = client
         .query_one(
             "INSERT INTO sync_changes
@@ -373,11 +566,10 @@ pub async fn append_change(client: &Client, change: &NewChange<'_>) -> Result<i6
 /// When `after = 0` the device holds nothing, so there is no row to correct and a historical
 /// tombstone would be pure noise.
 ///
-/// # The same visibility guard as pull
+/// # The same watermark as pull
 ///
-/// The `xmin` guard from [`changes_after`] applies here for the same reason: a row whose inserting
-/// transaction may still be in flight must not set `next_cursor` past a change the device will
-/// never be given. See #62 for the guard's cost.
+/// [`safe_watermark`] applies here for the same reason: a row whose inserting transaction may still
+/// be in flight must not set `next_cursor` past a change the device will never be given.
 ///
 /// # Errors
 /// Returns [`ServerError::Database`] on a query failure, or [`ServerError::Corrupt`] if a stored
@@ -388,6 +580,10 @@ pub async fn bootstrap_after(
     after: u64,
     limit: i64,
 ) -> Result<Page, ServerError> {
+    // The same watermark pull uses, for the same reason: a bootstrap that compacted over a row
+    // whose insert had not committed would hand a device a `next_cursor` past a change it will
+    // never receive -- and a bootstrap is the one moment a device trusts the server completely.
+    let watermark = safe_watermark(client).await?;
     let after_i = i64::try_from(after).map_err(|_| ServerError::Corrupt {
         detail: format!("bootstrap cursor {after} does not fit a bigint"),
     })?;
@@ -403,15 +599,14 @@ pub async fn bootstrap_after(
                         seq, entity, entity_id, op, snapshot, row_version, schema_version
                    FROM sync_changes
                   WHERE scope = $1
-                    AND xmin::text::bigint
-                        < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+                    AND seq <= $4
                   ORDER BY entity, entity_id, seq DESC
                ) AS latest
               WHERE seq > $2
                 AND (op <> 'delete' OR $2 > 0)
               ORDER BY seq ASC
               LIMIT $3",
-            &[&scope.as_str(), &after_i, &(limit + 1)],
+            &[&scope.as_str(), &after_i, &(limit + 1), &watermark],
         )
         .await?;
 

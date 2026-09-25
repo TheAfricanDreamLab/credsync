@@ -17,7 +17,7 @@ A push notification is only ever a hint to run the loop, never a carrier of stat
 |---|---|
 | **Scope** | The unit of subscription and isolation, e.g. `(institution_id, enrollment_id)`. A client syncs only its subscribed scopes. Scope membership is authorized server-side at token mint. |
 | **Entity** | A synced table registered with credSync: name, scope mapping, conflict class, schema version. |
-| **Change log** | Append-only `sync_changes`: `(seq bigserial, scope, entity, entity_id, op upsert\|delete, snapshot jsonb, row_version, schema_version)`. Written by domain handlers via the outbox in the same transaction as the state change. **Snapshots, not diffs; deletes are tombstones.** |
+| **Change log** | Append-only `sync_changes`: `(seq bigserial, scope, entity, entity_id, op upsert\|delete, snapshot jsonb, row_version, schema_version)`. Written by domain handlers via the outbox in the same transaction as the state change, which **must take the writer lock first** (§5). **Snapshots, not diffs; deletes are tombstones.** |
 | **Cursor** | The client's last applied `seq`, per scope. Pull walks the log forward from it. |
 | **Command** | A client-originated domain mutation. The only way client writes reach the server. |
 | **Dedupe record** | Server table keyed by command `id` storing the outcome. Replays return the recorded result without re-applying. |
@@ -27,17 +27,15 @@ A push notification is only ever a hint to run the loop, never a carrier of stat
 Every rule about encoding, size, and timing lives here. Endpoints reference it; they do not
 restate it.
 
-- **Canonical encoding is compact JSON.** Canonical means byte-stable: the same logical value
-  always encodes to identical bytes. Object keys are sorted; no incidental whitespace; one
-  numeric representation. Checksums and digests are computed over this encoding, so instability
-  produces phantom corruption.
+- **Canonical encoding is compact JSON**, byte-stable: sorted keys, no incidental whitespace, one
+  numeric representation, so the same logical value always encodes identically. Checksums and
+  digests are computed over it, and instability there produces phantom corruption.
 - **Compression** is Brotli or gzip on the wire, by negotiation.
 - **Byte budgets are compressed-size budgets.** Default 100 KB per batch. A single change larger
   than the budget is still delivered alone rather than stalling the cursor.
 - **Requests tolerate 30-second completion.** A cycle interrupted mid-batch resumes from the
   persisted cursor (§4).
-- **Backoff is exponential with jitter**, drawn from the client's seeded entropy source so that
-  simulated runs replay identically.
+- **Backoff is exponential with jitter**, from the client's seeded entropy so simulated runs replay.
 - The codec is isolated in `credsync-protocol`, so a binary encoding may arrive as protocol v2
   without touching the state machine.
 
@@ -75,12 +73,10 @@ truncation converts hostile input into a silently wrong value.
 
 **`snapshot` and `payload` contain no floats, at any depth.** A float is refused, not coerced.
 
-JSON float parsing is not exact in practice: a value can re-parse one ULP from what was written,
-then re-encode shorter. Such a document survives no serialize/parse/serialize cycle intact, so two
-sides holding the same row compute different digests (§5) and the client re-bootstraps against a
-divergence that never happened — the detector firing on itself.
-
-Use scaled integers or decimal strings. Both are exact, and portable where JSON floats are not.
+JSON float parsing is not exact: a value can re-parse one ULP from what was written and re-encode
+shorter, so it survives no serialize/parse/serialize cycle intact. Two sides holding the same row
+then compute different digests (§5) and the client re-bootstraps against a divergence that never
+happened — the detector firing on itself. Use scaled integers or decimal strings; both are exact.
 
 ## 3. Endpoints
 
@@ -150,19 +146,23 @@ response: { protocol: 1, results: [ { id, status, reason?, server_seq? } ] }
   pull; the client compares after apply. The digest is incremental — applying N changes
   individually equals applying them as a batch — and a tombstone leaves the digest as though the
   row had never existed.
-- **A digest mismatch means silent divergence.** The client marks the scope tainted,
-  re-bootstraps, replays its own outbox, and emits telemetry carrying *both* digests. A tainted scope does not block others.
+- **A digest mismatch means silent divergence.** The client marks the scope tainted, re-bootstraps,
+  replays its outbox, and emits telemetry carrying *both* digests. A tainted scope does not block
+  others.
+- **A change-log writer takes the shared writer lock first**, for its whole transaction. `seq` is
+  allocated at `INSERT` but the row appears at `COMMIT`, so without it a reader delivers a later
+  `seq` while an earlier one is pending and the client advances past a change it never receives. A
+  reader takes it exclusively to find an instant with nothing in flight and delivers only to the
+  `seq` allocated then — or to the last such `seq`, staler and never wrong.
 
-**Algorithms**, both truncated to 128 bits. *Batch checksums and scope digests* use **xxh3**: they
-ask "is this intact" on a channel TLS already protects, run per batch and per row on a
-battery-powered phone, and benchmark 4.6x faster. *Command payload checksums* use **BLAKE3**:
-refusing a mutated replay is a promise no non-cryptographic hash makes.
+**Algorithms**, both truncated to 128 bits. Batch checksums and scope digests use **xxh3**; command
+payload checksums use **BLAKE3**, because refusing a mutated replay is a promise no
+non-cryptographic hash makes. See D-031.
 
 ## 6. Conflict classes
 
 The entity registry declares each entity's class in the host's schema definition. The simulator
-generates its invariants per class, so a policy claim here is a tested property rather than
-documentation.
+generates its invariants per class, so a policy claim here is a tested property, not documentation.
 
 | Class | Policy | Mechanics |
 |---|---|---|
