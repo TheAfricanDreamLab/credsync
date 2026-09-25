@@ -99,3 +99,20 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 echo "  ok    every wire-facing decoder is fuzzed, and every target names a real one"
+
+# The committed corpus holds *seeds*, not the output of a run.
+#
+# libFuzzer names the units it discovers by content hash, so they are trivially distinguishable
+# from the golden fixtures — and there are a lot of them. Running the smoke suite once locally and
+# committing what it left behind put 938 generated units and 3.8 MB into this repository, on the
+# very commit that documented not doing that.
+#
+# The nightly job caches its corpus and uploads it as an artifact; that is where volume belongs.
+generated=$(find "$(dirname "$0")/../credsync-protocol/fuzz/corpus" -type f ! -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$generated" -ne 0 ]; then
+  echo
+  echo "FAIL: $generated generated unit(s) in fuzz/corpus - only .json seeds belong here." >&2
+  echo "Remove them with:" >&2
+  echo "  find credsync-protocol/fuzz/corpus -type f ! -name '*.json' -delete" >&2
+  exit 1
+fi
