@@ -27,6 +27,51 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  fuzz-deep:
+    name: fuzz, long run
+    runs-on: ubuntu-latest
+    # Eighteen targets at fifteen minutes each is four and a half hours of fuzzing, plus build.
+    # The ceiling is generous rather than tight: a run that needed longer should be reported as
+    # slow, not truncated into a green tick.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Fifteen minutes per target, against the committed corpus. The corpus is why this gets
+      # better over time rather than re-deriving the same shallow inputs every night: each run
+      # starts from everything previous runs found interesting.
+      - name: fuzz every decoder, deeply
+        run: ./scripts/fuzz.sh 900
+
+      # A crash artifact IS the bug report - it reproduces with
+      # `cargo +nightly fuzz run <target> <file>`. CS-29 requires it to become an issue carrying
+      # that input, and for the input to join the corpus, so the next run starts from what broke
+      # us rather than hoping to rediscover it.
+      - name: keep crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: credsync-protocol/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # What the run learned. Committing this back is a judgement call left to a person: a corpus
+      # that grows unattended becomes a slow checkout for everybody, so it is offered rather than
+      # pushed.
+      - name: keep the grown corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: credsync-protocol/fuzz/corpus/
+          retention-days: 14
+
   deep-property-tests:
     name: property tests, deep
     runs-on: ubuntu-latest

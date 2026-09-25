@@ -1,0 +1,133 @@
+# Deliberately its own workspace, not a member of credsync's.
+#
+# `cargo fuzz` builds with sanitizer and coverage flags (`-Zsanitizer=address`, sancov passes) and
+# on a nightly toolchain. Pulling that into the main workspace would mean every ordinary
+# `cargo build` resolved a nightly-only, sanitiser-instrumented crate, and `cargo deny` would audit
+# `libfuzzer-sys` as though it shipped. It does not: this crate is never published and never linked
+# into anything a device runs.
+[workspace]
+
+[package]
+name = "credsync-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dependencies.credsync-protocol]
+path = ".."
+
+[[bin]]
+name = "batch"
+path = "fuzz_targets/batch.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "change"
+path = "fuzz_targets/change.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "command"
+path = "fuzz_targets/command.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "payload"
+path = "fuzz_targets/payload.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "pull_request"
+path = "fuzz_targets/pull_request.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "pull_response"
+path = "fuzz_targets/pull_response.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "push_request"
+path = "fuzz_targets/push_request.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "push_response"
+path = "fuzz_targets/push_response.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "bootstrap_request"
+path = "fuzz_targets/bootstrap_request.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "bootstrap_response"
+path = "fuzz_targets/bootstrap_response.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "command_result"
+path = "fuzz_targets/command_result.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "forced_upgrade"
+path = "fuzz_targets/forced_upgrade.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "entity_registration"
+path = "fuzz_targets/entity_registration.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "op"
+path = "fuzz_targets/op.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "status"
+path = "fuzz_targets/status.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "conflict_class"
+path = "fuzz_targets/conflict_class.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "scope_cursor"
+path = "fuzz_targets/scope_cursor.rs"
+test = false
+doc = false
+bench = false
