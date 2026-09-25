@@ -184,3 +184,114 @@ async fn a_change_committed_after_a_higher_seq_is_not_skipped() {
         "the earlier seq must come first"
     );
 }
+
+/// **A lower `seq` still in flight is never skipped, even when its writer holds a higher xid.**
+///
+/// The interleaving that defeated the original guard (#74). It is not exotic: a host that writes
+/// domain state before its change-log row takes its xid early and its `seq` late, which is exactly
+/// what `docs/spec.md` §1 prescribes.
+///
+/// ```text
+///   T0: BEGIN; INSERT elsewhere     -> takes the LOWER xid
+///   T1: BEGIN; INSERT sync_changes  -> takes the higher xid, and the LOWER seq   (stays open)
+///   T0:        INSERT sync_changes  -> the higher seq; COMMIT
+/// ```
+///
+/// The old guard admitted T0's row because its `xmin` was below the snapshot's — and T1's lower
+/// `seq` was still uncommitted underneath it. A client would have advanced its cursor past a change
+/// it would never be given.
+#[tokio::test]
+async fn a_lower_seq_in_flight_is_not_skipped_when_its_writer_holds_a_higher_xid() {
+    let _serialiser = serialised().await;
+    let reader = fresh().await;
+    let sc = unique_scope("xid_order_does_not_bound_seq_order");
+
+    // T0 takes its xid first, by writing somewhere else entirely.
+    let t0 = connect().await;
+    t0.batch_execute("BEGIN").await.expect("begins");
+    append(&t0, &unique_scope("xid_warmup"), "warmup", 16, 1).await;
+
+    // T1 then takes a later xid and an EARLIER seq, and stays open.
+    let t1 = connect().await;
+    t1.batch_execute("BEGIN").await.expect("begins");
+    db::lock_for_write(&t1)
+        .await
+        .expect("takes the writer lock");
+    append(&t1, &sc, "early", 16, 1).await;
+
+    // T0 now takes a LATER seq and commits, while T1 is still open.
+    append(&t0, &sc, "late", 16, 1).await;
+    t0.batch_execute("COMMIT").await.expect("commits");
+
+    // A reader must be given nothing: the only visible row sits above an uncommitted one.
+    let during = db::changes_after(&reader, &scope(&sc), 0, 100)
+        .await
+        .expect("reads")
+        .changes;
+    assert!(
+        during.is_empty(),
+        "the reader was handed {} change(s) while a LOWER seq was still uncommitted; advancing \
+         the cursor past them loses the earlier one for ever. seqs delivered: {:?}",
+        during.len(),
+        during.iter().map(|c| c.seq.get()).collect::<Vec<_>>()
+    );
+
+    t1.batch_execute("COMMIT").await.expect("commits");
+
+    // Once both commit, both arrive, in seq order.
+    let after = db::changes_after(&reader, &scope(&sc), 0, 100)
+        .await
+        .expect("reads")
+        .changes;
+    assert_eq!(
+        after.len(),
+        2,
+        "both changes must arrive once the writers commit"
+    );
+    assert!(
+        after[0].seq.get() < after[1].seq.get(),
+        "the pair arrived out of seq order"
+    );
+    assert_eq!(
+        after[0].entity_id.as_str(),
+        "early",
+        "the earlier seq must come first"
+    );
+}
+
+/// An unrelated transaction does not withhold anything. `docs/spec.md` §5, issue #62.
+///
+/// The liveness half. The old guard keyed on `pg_snapshot_xmin`, which reflects the oldest
+/// transaction running anywhere in the **cluster** — so a `pg_dump`, an analytics query, or one
+/// leaked idle-in-transaction connection stalled sync for every scope and every client. The
+/// watermark waits only for change-log writers.
+#[tokio::test]
+async fn an_unrelated_open_transaction_does_not_withhold_anything() {
+    let _serialiser = serialised().await;
+    let writer = fresh().await;
+    let sc = unique_scope("unrelated_transaction");
+
+    append(&writer, &sc, "r1", 16, 1).await;
+
+    // Something else entirely, holding a transaction open and touching nothing of ours.
+    let bystander = connect().await;
+    bystander.batch_execute("BEGIN").await.expect("begins");
+    bystander
+        .query_one("SELECT txid_current()", &[])
+        .await
+        .expect("takes an xid");
+
+    let delivered = db::changes_after(&writer, &scope(&sc), 0, 100)
+        .await
+        .expect("reads")
+        .changes;
+
+    bystander.batch_execute("COMMIT").await.ok();
+
+    assert_eq!(
+        delivered.len(),
+        1,
+        "a committed row was withheld because an unrelated transaction was open somewhere in the \
+         cluster; that is #62, and sync stalls for every scope while it lasts"
+    );
+}
