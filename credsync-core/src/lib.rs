@@ -79,6 +79,6 @@ pub use outbox::{OutboxEntry, OutboxError, Resolution, Resolved};
 pub use registry::{Registry, RegistryError};
 pub use scope::{ScopeHealth, ScopeState};
 pub use storage::{StorageOp, TxOutcome};
-pub use traits::{Clock, Compressor, Entropy, Storage, Transport};
+pub use traits::{Clock, Compressor, Entropy, Storage, StoredScope, Transport};
 pub use types::{RequestId, Timestamp};
 pub use wire::{WireRequest, WireResponse};

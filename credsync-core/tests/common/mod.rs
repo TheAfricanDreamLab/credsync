@@ -11,7 +11,9 @@
 use credsync_core::{
     Clock, Compressor, Entropy, OutboxEntry, Transport, TransportError, WireRequest,
 };
-use credsync_core::{RequestId, Storage, StorageError, StorageOp, Timestamp, TxOutcome};
+use credsync_core::{
+    RequestId, Storage, StorageError, StorageOp, StoredScope, Timestamp, TxOutcome,
+};
 use credsync_protocol::{
     Batch, Change, Command, CommandId, CommandName, CommandResult, ConflictClass, Cursor, EntityId,
     EntityName, EntityRegistration, HexString, Op, Payload, ProtocolVersion, PushResponse, Reason,
@@ -266,6 +268,36 @@ impl Storage for FakeStorage {
             .get(&(entity.clone(), entity_id.clone()))
             .map(|r| r.row_version))
     }
+
+    fn scope_state(&self, scope: &ScopeId) -> Result<Option<StoredScope>, StorageError> {
+        if let Some(e) = &self.fail_read {
+            return Err(e.clone());
+        }
+        Ok(self.cursors.get(scope).map(|cursor| StoredScope {
+            cursor: *cursor,
+            digest: self
+                .digests
+                .get(scope)
+                .cloned()
+                .unwrap_or_else(|| hex("00000000000000000000000000000000")),
+        }))
+    }
+
+    /// The queued commands, oldest first.
+    ///
+    /// `queued` records `(id, schema_version)` rather than whole commands, so the bodies are
+    /// rebuilt here. Enough for the engine to know *what is still queued*, which is what the
+    /// reload is for.
+    fn outbox(&self) -> Result<Vec<OutboxEntry>, StorageError> {
+        if let Some(e) = &self.fail_read {
+            return Err(e.clone());
+        }
+        Ok(self
+            .queued
+            .iter()
+            .map(|(id, schema)| OutboxEntry::new(command_with_id(*id), *schema))
+            .collect())
+    }
 }
 
 /// A handle onto a [`FakeStorage`] that the engine can own while the test still watches it.
@@ -305,6 +337,14 @@ impl Storage for SharedStorage {
         entity_id: &EntityId,
     ) -> Result<Option<RowVersion>, StorageError> {
         self.0.borrow().row_version(entity, entity_id)
+    }
+
+    fn scope_state(&self, scope: &ScopeId) -> Result<Option<StoredScope>, StorageError> {
+        self.0.borrow().scope_state(scope)
+    }
+
+    fn outbox(&self) -> Result<Vec<OutboxEntry>, StorageError> {
+        self.0.borrow().outbox()
     }
 }
 
@@ -536,6 +576,35 @@ pub fn new_engine_with(compressor: FakeCompressor) -> (TestEngine, SharedStorage
     );
     register_defaults(engine.registry_mut());
     (engine, storage)
+}
+
+/// Rebuilds a command from its id, for the outbox reload.
+///
+/// The fake stores ids rather than bodies, and the reload only needs identity — an entry that is
+/// still queued, and under which schema. A test that cared about the body would keep its own copy.
+#[must_use]
+pub fn command_with_id(id: CommandId) -> Command {
+    let mut c = command(0, 0);
+    c.id = id;
+    c
+}
+
+/// A second engine over storage that already exists.
+///
+/// For modelling an adapter that committed and then reported failure: one engine writes, another
+/// holds memory that is now behind what storage contains — which is exactly the state that lie
+/// leaves behind, and which cannot be produced with a single engine that only advances on success.
+#[must_use]
+pub fn engine_over(storage: SharedStorage) -> TestEngine {
+    let mut engine = credsync_core::Engine::new(
+        FakeClock::default(),
+        FakeEntropy::default(),
+        storage,
+        FakeTransport::default(),
+        FakeCompressor::with_ratio(1),
+    );
+    register_defaults(engine.registry_mut());
+    engine
 }
 
 /// An engine with a deliberately empty registry.

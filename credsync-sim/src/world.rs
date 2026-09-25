@@ -398,6 +398,14 @@ impl World {
                 self.devices[i].pending_kill = true;
                 StorageVerdict::CommitThenLoseAck
             }
+            // The same lie, without the restart. The restart is what made the paired version
+            // survivable -- a restarted engine reloads from storage and never consults the state
+            // the lie invalidated -- so this is the one that reaches the defence (#55).
+            Some(Fault::StorageLiedAboutCommit) => {
+                self.trace
+                    .fault(self.now_ms, i, Fault::StorageLiedAboutCommit);
+                StorageVerdict::CommitThenLoseAck
+            }
             _ => StorageVerdict::Commit,
         };
         self.devices[i].storage.0.borrow_mut().verdict = verdict;

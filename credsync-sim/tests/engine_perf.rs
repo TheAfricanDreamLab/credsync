@@ -63,6 +63,19 @@ impl credsync_core::Storage for Sink {
     ) -> Result<Option<credsync_protocol::RowVersion>, credsync_core::StorageError> {
         Ok(None)
     }
+
+    /// Holds no scopes: this file measures `build_push`, not storage behaviour.
+    fn scope_state(
+        &self,
+        _scope: &ScopeId,
+    ) -> Result<Option<credsync_core::StoredScope>, credsync_core::StorageError> {
+        Ok(None)
+    }
+
+    /// Holds no outbox: this file measures `build_push`, not storage behaviour.
+    fn outbox(&self) -> Result<Vec<OutboxEntry>, credsync_core::StorageError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Default)]

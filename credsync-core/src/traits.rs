@@ -24,10 +24,11 @@
 //! constraint the design never needed. `tests/single_threaded.rs` holds this to it.
 
 use crate::error::{StorageError, TransportError};
+use crate::outbox::OutboxEntry;
 use crate::storage::{StorageOp, TxOutcome};
 use crate::types::{RequestId, Timestamp};
 use crate::wire::WireRequest;
-use credsync_protocol::{EntityId, EntityName, RowVersion};
+use credsync_protocol::{Cursor, EntityId, EntityName, HexString, RowVersion, ScopeId};
 
 /// Reads the wall clock.
 ///
@@ -65,6 +66,29 @@ pub trait Entropy {
 pub trait Storage {
     /// Applies every op in one transaction.
     ///
+    /// # An adapter must never report failure after committing
+    ///
+    /// Whole or not at all, in both directions. Partially applying and reporting success is the
+    /// obvious violation; **committing and then reporting failure is the subtle one**, and it is
+    /// the more damaging because nothing errors.
+    ///
+    /// The engine then holds a cursor, digest and outbox that are behind what storage contains. Its
+    /// next pull re-fetches changes storage already has, the digest regresses permanently, and the
+    /// scope reports divergence on every pull for the rest of its life. Its next push re-sends
+    /// entries storage has already resolved, recording a second outcome for one command —
+    /// inflating the dead-letter list a user actually reads.
+    ///
+    /// The window is real on mobile: SQLite can commit and have the process killed before the
+    /// return value is observed. In-process that is a kill, and a restarted engine is safe. But a
+    /// binding that catches the error across an FFI boundary, or a wrapper that retries, turns a
+    /// kill into a *returned error with the engine still alive* — which is the dangerous shape.
+    ///
+    /// **The engine defends against it anyway.** After any error here it treats its cached state
+    /// for the affected scope, and its outbox, as of unknown accuracy and reloads both from
+    /// [`scope_state`](Self::scope_state) and [`outbox`](Self::outbox) — because it cannot
+    /// distinguish "nothing was written" from "everything was written and I was not told", and the
+    /// cost of assuming the worse one is two reads (#55).
+    ///
     /// # Errors
     /// Returns [`StorageError::Transient`] when retrying could help and
     /// [`StorageError::Corrupt`] when the local database is unusable. An adapter must not
@@ -99,6 +123,70 @@ pub trait Storage {
         entity: &EntityName,
         entity_id: &EntityId,
     ) -> Result<Option<RowVersion>, StorageError>;
+
+    /// The cursor and digest currently stored for a scope, or `None` if it has never synced.
+    ///
+    /// # Why the engine needs to re-read what it just wrote
+    ///
+    /// The engine caches each scope's cursor and digest in memory and advances them only after
+    /// `transact` returns `Ok` — which is right, and not enough. An adapter that **commits and
+    /// then reports failure** leaves the engine holding state that is stale rather than merely
+    /// unadvanced, and the consequence is silent:
+    ///
+    /// ```text
+    ///   transact(ops)  ->  committed, then Err(Transient)
+    ///   engine         ->  does not advance its cursor or digest (correct)
+    ///   next pull      ->  re-fetches changes storage already holds
+    ///   stage_change   ->  reads row_version, which is ALREADY the new value, so
+    ///                      digest.update(new, new) is a no-op
+    ///                  ->  writes the STALE in-memory digest over the correct stored one
+    /// ```
+    ///
+    /// The rows stay right and the digest regresses permanently, so the scope reports divergence
+    /// on every pull for the rest of its life. Nothing in the engine can detect it, because the
+    /// layer that lied is the one it would have to ask.
+    ///
+    /// So after any `StorageError` the engine stops trusting its cached state for that scope and
+    /// reloads it here. **An adapter must never report failure after committing** — but this is
+    /// cheap, and the failure it prevents is silent and permanent (#55).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] if the local database cannot be read. A scope that has
+    /// never synced is `Ok(None)`, not an error.
+    fn scope_state(&self, scope: &ScopeId) -> Result<Option<StoredScope>, StorageError>;
+
+    /// Every outbox entry currently stored, oldest first.
+    ///
+    /// Read for the same reason as [`scope_state`](Self::scope_state), and it is the same failure
+    /// wearing different clothes. After a transaction that committed and reported failure, the
+    /// engine's in-memory outbox still holds entries storage has already resolved. Those entries
+    /// are pushed again, the server's dedupe table returns the same verdict, and the engine records
+    /// a **second** outcome for one command — which `docs/spec.md` §3.3 forbids, and which matters
+    /// because the user's dead-letter list is built by counting those records.
+    ///
+    /// Found by the simulator once a fault existed that lies about a commit *without* killing the
+    /// device. The paired kill-and-restart version could never reach it: a restarted engine reloads
+    /// everything and never consults the state the lie invalidated (#55).
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] if the local database cannot be read. An empty outbox is
+    /// `Ok(vec![])`, not an error.
+    fn outbox(&self) -> Result<Vec<OutboxEntry>, StorageError>;
+}
+
+/// A scope's persisted sync position, as storage holds it.
+///
+/// Deliberately the stored form — a `HexString` digest rather than a [`ScopeDigest`] — because that
+/// is what an adapter has. Converting is the engine's job, and an adapter that had to reconstruct
+/// the digest type would be reconstructing the arithmetic D-039 kept out of every port.
+///
+/// [`ScopeDigest`]: credsync_protocol::ScopeDigest
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredScope {
+    /// The last `seq` applied for this scope.
+    pub cursor: Cursor,
+    /// The digest recorded alongside it, 32 lowercase hex characters.
+    pub digest: HexString,
 }
 
 /// Measures how large a payload will be once compressed.

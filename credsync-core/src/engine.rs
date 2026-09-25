@@ -20,7 +20,7 @@ use core::fmt;
 use credsync_protocol::{
     Batch, BootstrapResponse, Change, Command, CommandId, ConflictClass, EntityId, EntityName,
     ForcedUpgrade, Payload, ProtocolVersion, PushRequest, PushResponse, Reason, SchemaVersion,
-    ScopeId, Snapshot, Status, canonical, limits,
+    ScopeDigest, ScopeId, Snapshot, Status, canonical, limits,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -88,6 +88,18 @@ where
     registry: Registry,
     /// The host's registered up-migrations. `docs/spec.md` §7.
     migrations: Migrations,
+    /// Scopes whose cached cursor and digest may no longer match storage.
+    ///
+    /// Set whenever `transact` returns an error, because a failure does not say *which* failure: an
+    /// adapter that committed and then reported failure leaves this engine holding stale state
+    /// rather than merely unadvanced state, and it cannot tell the two apart. See
+    /// [`Storage::scope_state`] for what that costs if nobody reloads (#55).
+    suspect: BTreeSet<ScopeId>,
+    /// Set when the in-memory outbox may no longer match storage.
+    ///
+    /// Not keyed by scope, because the outbox is not: one failed transaction makes the whole queue
+    /// of unknown accuracy. See [`Storage::outbox`] for the second outcome it otherwise produces.
+    outbox_suspect: bool,
     /// Per-scope divergence state. `docs/spec.md` §5.
     ///
     /// Keyed by scope so a tainted scope cannot stop the others syncing, which the spec requires
@@ -124,6 +136,8 @@ where
             migrations: Migrations::new(),
             upgrade_required: None,
             health: BTreeMap::new(),
+            suspect: BTreeSet::new(),
+            outbox_suspect: false,
         }
     }
 
@@ -248,6 +262,11 @@ where
         compare_digest: bool,
         rebuilding: bool,
     ) -> Result<Applied, ApplyError> {
+        // A previous transaction failed on this scope, so the cached cursor and digest are of
+        // unknown accuracy: the adapter may have committed and then reported failure, which leaves
+        // them stale rather than merely unadvanced. Re-read the truth before touching it.
+        self.refresh_if_suspect(&batch.scope)?;
+
         let state = self.scopes.get(&batch.scope).copied().unwrap_or_default();
 
         apply::validate_ordering(batch, state.cursor.get())?;
@@ -365,7 +384,17 @@ where
             });
         }
 
-        let outcome = self.storage.transact(&ops)?;
+        let outcome = match self.storage.transact(&ops) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Whatever went wrong, this engine no longer knows whether the write landed. The
+                // next apply for this scope reloads rather than trusting memory, and so does the
+                // next thing that touches the outbox.
+                self.suspect.insert(batch.scope.clone());
+                self.outbox_suspect = true;
+                return Err(e.into());
+            }
+        };
         debug_assert_eq!(
             outcome.applied,
             ops.len(),
@@ -455,6 +484,78 @@ where
         }))
     }
 
+    /// Reloads a scope's cursor and digest from storage if a previous transaction failed on it.
+    ///
+    /// # Why a failed write means the cache is stale, not merely behind
+    ///
+    /// `apply_changes` advances memory only after `transact` returns `Ok`, which is correct and
+    /// insufficient. An adapter that commits and *then* reports failure leaves storage ahead of
+    /// memory, and the next apply re-fetches changes storage already holds. `stage_change` then
+    /// reads a `row_version` that is already the new value, so `digest.update(new, new)` is a
+    /// no-op — and the stale in-memory digest is written back over the correct stored one.
+    ///
+    /// The rows stay right. The digest regresses permanently, and the scope reports divergence on
+    /// every pull for the rest of its life: silent, and exactly the shape of failure this project
+    /// exists to prevent (#55).
+    ///
+    /// The contract says an adapter must never do this. This defends anyway, because the engine
+    /// cannot distinguish "nothing was written" from "everything was written and I was not told",
+    /// and the cost of assuming the worse one is a single read.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError::Storage`] if the reload fails. The scope stays suspect, so the next
+    /// attempt tries again rather than proceeding on state it does not trust.
+    fn refresh_if_suspect(&mut self, scope: &ScopeId) -> Result<(), ApplyError> {
+        if !self.suspect.contains(scope) {
+            return Ok(());
+        }
+
+        match self.storage.scope_state(scope)? {
+            Some(stored) => {
+                // A digest storage cannot parse is treated as empty rather than guessed at: an
+                // empty digest disagrees with the server on the next pull, which reports divergence
+                // and heals (CS-22). A guessed one would agree by accident and never heal.
+                let digest = u128::from_str_radix(stored.digest.as_str(), 16)
+                    .map_or(ScopeDigest::EMPTY, ScopeDigest::from_raw);
+                self.scopes
+                    .insert(scope.clone(), ScopeState::restored(stored.cursor, digest));
+            }
+            // Storage holds nothing for this scope, so neither should memory. Leaving a cached
+            // cursor here would have the client resume from a position storage cannot support.
+            None => {
+                self.scopes.remove(scope);
+            }
+        }
+
+        // Cleared only after the reload succeeded.
+        self.suspect.remove(scope);
+        Ok(())
+    }
+
+    /// Reloads the outbox from storage if a previous transaction failed.
+    ///
+    /// The same defence as [`refresh_if_suspect`](Self::refresh_if_suspect), for the queue rather
+    /// than the scope. An adapter that committed and reported failure leaves entries resolved in
+    /// storage and still queued in memory; pushing them again earns the same verdict from the
+    /// server's dedupe table and records a **second** outcome for one command.
+    ///
+    /// `docs/spec.md` §3.3 gives one result per submitted command, and the user's dead-letter list
+    /// is built by counting those records — so a duplicate is a user-visible wrong number, not an
+    /// internal tidiness question.
+    ///
+    /// # Errors
+    /// Returns [`OutboxError::Storage`] if the reload fails. The flag stays set, so the next
+    /// attempt tries again rather than proceeding on a queue it does not trust.
+    fn refresh_outbox_if_suspect(&mut self) -> Result<(), OutboxError> {
+        if !self.outbox_suspect {
+            return Ok(());
+        }
+        let stored = self.storage.outbox()?;
+        self.outbox = stored.into_iter().collect();
+        self.outbox_suspect = false;
+        Ok(())
+    }
+
     /// How much this client trusts its copy of a scope. `docs/spec.md` §5.
     #[must_use]
     pub fn scope_health(&self, scope: &ScopeId) -> ScopeHealth {
@@ -537,7 +638,7 @@ where
             },
             StorageOp::SetScopeDigest {
                 scope: scope.clone(),
-                digest: credsync_protocol::ScopeDigest::EMPTY.to_hex(),
+                digest: ScopeDigest::EMPTY.to_hex(),
             },
         ];
         self.storage.transact(&ops)?;
@@ -651,10 +752,13 @@ where
     pub fn enqueue(&mut self, entry: OutboxEntry) -> Result<(), OutboxError> {
         self.registry.check_command(&entry.command)?;
 
-        self.storage.transact(&[StorageOp::EnqueueCommand {
+        if let Err(e) = self.storage.transact(&[StorageOp::EnqueueCommand {
             command: entry.command.clone(),
             schema_version: entry.schema_version,
-        }])?;
+        }]) {
+            self.outbox_suspect = true;
+            return Err(e.into());
+        }
         self.outbox.push_back(entry);
         Ok(())
     }
@@ -865,6 +969,10 @@ where
     /// Returns [`OutboxError::Storage`] if the resolutions could not be committed. Nothing is
     /// removed from the in-memory outbox in that case, so the push is simply retried.
     pub fn apply_results(&mut self, response: &PushResponse) -> Result<Resolved, OutboxError> {
+        // A previous transaction failed, so entries this engine believes are queued may already be
+        // resolved in storage. Answering for them again records a second outcome for one command,
+        // which `docs/spec.md` §3.3 forbids and which inflates the user's dead-letter list.
+        self.refresh_outbox_if_suspect()?;
         let mut ops: Vec<StorageOp> = Vec::new();
         let mut resolutions: Vec<(CommandId, Resolution)> = Vec::new();
         let mut unknown = 0usize;
@@ -955,7 +1063,10 @@ where
         // Reversed, a failed commit would leave commands gone from memory and still pending in
         // storage: resurrected at the next launch and pushed again, which the server would dedupe
         // -- but the user's dead-letter would have silently vanished in the meantime.
-        self.storage.transact(&ops)?;
+        if let Err(e) = self.storage.transact(&ops) {
+            self.outbox_suspect = true;
+            return Err(e.into());
+        }
 
         for (id, _) in &resolutions {
             self.outbox.retain(|e| e.id() != *id);
