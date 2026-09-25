@@ -72,6 +72,9 @@ fn run_one(seed: u64, trace_wanted: bool) -> ExitCode {
 /// The seed is the whole reproduction, so it goes at the top and again at the bottom as a
 /// runnable command. Someone reading a CI log at speed should be able to copy one line.
 fn report(seed: u64, violations: &[credsync_sim::Violation]) {
+    // The version goes with the seed, always. A seed alone is only a reproduction if the schedule
+    // that produced it is the one replaying it -- see `SIM_VERSION`.
+    eprintln!("  simulator v{}", credsync_sim::SIM_VERSION);
     eprintln!();
     eprintln!("FAILED at seed 0x{seed:016x}");
     for v in violations.iter().take(20) {

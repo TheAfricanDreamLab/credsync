@@ -77,9 +77,13 @@ fn a_storage_failure_makes_the_engine_reload_the_scope() {
         "an honest rollback should have changed nothing"
     );
 
-    // The next successful apply must have re-read the scope. If it trusted its cache it would
-    // still work here — so the assertion is on the *read*, counted below.
-    let reads_before = storage.with(|s| s.attempts);
+    // The next successful apply must have re-READ the scope.
+    //
+    // Counted as reads, not as transactions. The first version of this asserted on `attempts`,
+    // which counts `transact` — and every successful apply makes one, so the assertion held with
+    // the defence deleted. Caught in review on #77, and it is the third test in this session that
+    // passed for a reason unrelated to what it claimed to check.
+    let reads_before = storage.with(|s| s.scope_reads.get());
     engine
         .apply_batch(&common::batch_with_digest(
             vec![common::upsert(2, "r2", 1)],
@@ -87,8 +91,8 @@ fn a_storage_failure_makes_the_engine_reload_the_scope() {
         ))
         .expect("applies");
     assert!(
-        storage.with(|s| s.attempts) > reads_before,
-        "the engine did not touch storage again after a failure"
+        storage.with(|s| s.scope_reads.get()) > reads_before,
+        "the engine did not re-read the scope after a failure"
     );
 }
 
@@ -190,12 +194,190 @@ fn a_failed_reload_leaves_the_scope_suspect() {
         .apply_batch(&common::batch(vec![common::upsert(1, "r1", 1)]))
         .expect_err("the reload failed, so the apply must not proceed");
 
-    // With reads working again, the next attempt succeeds rather than staying stuck.
+    // With reads working again, the next attempt succeeds — and proves it re-read rather than
+    // simply giving up on the flag.
     storage.with_mut(|s| s.fail_read = None);
+    let reads_before = storage.with(|s| s.scope_reads.get());
     engine
         .apply_batch(&common::batch_with_digest(
             vec![common::upsert(1, "r1", 1)],
             digest_for("r1", 1),
         ))
         .expect("applies once storage is readable again");
+    assert!(
+        storage.with(|s| s.scope_reads.get()) > reads_before,
+        "the scope stopped being suspect without ever being re-read"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Reconciling without an apply
+// -------------------------------------------------------------------------------------------
+
+/// A suspect scope can be made trustworthy on demand, without an apply to carry the reload.
+///
+/// # The deadlock this pins
+///
+/// A caller that learns a scope is suspect will reasonably decline to build a request from it —
+/// that is the whole point of `needs_reload`. If the *only* thing that clears the flag is the head
+/// of `apply_changes`, that caller has deadlocked itself: the flag is cleared by an apply, an apply
+/// consumes a response, a response needs a request, and the request is what was withheld.
+///
+/// This is not hypothetical. Wiring the simulator's pull path to skip suspect scopes turned seed 1
+/// of `a_hostile_run_converges` red with *"still at cursor 49 after settling, with the server at
+/// 51; the device never caught up"* — a device permanently stuck one slice short, in a run whose
+/// faults had all stopped.
+///
+/// So the flag is not merely a signal to stand down; it comes with a way to stand up again.
+#[test]
+fn a_suspect_scope_can_be_reconciled_without_applying_anything() {
+    let (mut engine, storage) = common::new_engine();
+
+    engine
+        .apply_batch(&common::batch_with_digest(
+            vec![common::upsert(1, "r1", 1)],
+            digest_for("r1", 1),
+        ))
+        .expect("applies");
+
+    storage.with_mut(|s| {
+        s.fail_next = Some(StorageError::Transient {
+            detail: "committed, then lost the acknowledgement".to_owned(),
+        });
+    });
+    engine
+        .apply_batch(&common::batch(vec![common::upsert(2, "r1", 2)]))
+        .expect_err("the transaction failed");
+
+    assert!(
+        engine.needs_reload(&common::scope()),
+        "a failed transaction must leave the scope suspect"
+    );
+
+    let reads_before = storage.with(|s| s.scope_reads.get());
+    engine
+        .reload_scope(&common::scope())
+        .expect("storage is readable, so the reload succeeds");
+
+    assert!(
+        storage.with(|s| s.scope_reads.get()) > reads_before,
+        "reload_scope cleared the flag without reading storage"
+    );
+    assert!(
+        !engine.needs_reload(&common::scope()),
+        "the scope is reconciled, so the caller may now build a request from it"
+    );
+}
+
+/// A reload that cannot read storage leaves the scope suspect rather than reporting success.
+///
+/// The failure mode worth guarding: a `reload_scope` that swallowed its error would hand the caller
+/// a scope it believes is reconciled and is not, which is strictly worse than the deadlock above —
+/// the caller would go on to build a request from a cursor storage does not support.
+#[test]
+fn a_reload_that_cannot_read_storage_keeps_the_scope_suspect() {
+    let (mut engine, storage) = common::new_engine();
+
+    storage.with_mut(|s| {
+        s.fail_next = Some(StorageError::Transient {
+            detail: "committed, then lost the acknowledgement".to_owned(),
+        });
+    });
+    engine
+        .apply_batch(&common::batch(vec![common::upsert(1, "r1", 1)]))
+        .expect_err("the transaction failed");
+
+    storage.with_mut(|s| {
+        s.fail_read = Some(StorageError::Corrupt {
+            detail: "cannot read the scope back".to_owned(),
+        });
+    });
+    engine
+        .reload_scope(&common::scope())
+        .expect_err("the reload must report the read failure");
+
+    assert!(
+        engine.needs_reload(&common::scope()),
+        "a failed reload must leave the scope suspect so the next attempt tries again"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// The outbox, which fails the same way for a different reason
+// -------------------------------------------------------------------------------------------
+
+/// A command that committed under a reported failure is still pushed.
+///
+/// # Why the empty check is the bug
+///
+/// `enqueue` writes to storage and only then appends to the in-memory queue, so a commit reported
+/// as a failure leaves storage holding a command the cache has never heard of. `build_push` then
+/// finds an empty queue and returns `Ok(None)` — and because the only other reload lives in
+/// `apply_results`, which cannot run when no push was built, **nothing ever looks again**. The
+/// command is durable, invisible, and unsent for the life of the install.
+///
+/// That is why the reload sits *before* the `is_empty()` short-circuit rather than after it. An
+/// empty cache is precisely the state that needs checking, so a guard that trusts it to skip the
+/// check has inverted itself.
+///
+/// Found in review on #77 — where the reload this test covers had silently failed to apply at all,
+/// so the method the pull request described was not the method that shipped.
+#[test]
+fn a_command_that_committed_under_a_reported_failure_is_still_pushed() {
+    let (mut engine, storage) = common::new_engine();
+
+    // A second engine commits a command, standing in for the write that succeeded before the
+    // adapter reported failure. `fail_next` rolls back the staged write, so the durable entry has
+    // to come from somewhere the failure did not touch.
+    let mut writer = common::engine_over(storage.clone());
+    writer
+        .enqueue(common::entry(7, 0))
+        .expect("the honest write commits");
+
+    // The engine under test still has an empty cache, and now learns its own write failed.
+    storage.with_mut(|s| {
+        s.fail_next = Some(StorageError::Transient {
+            detail: "committed, then lost the acknowledgement".to_owned(),
+        });
+    });
+    engine
+        .enqueue(common::entry(8, 0))
+        .expect_err("the transaction failed");
+
+    let push = engine
+        .build_push(common::protocol(), 1_000_000)
+        .expect("building a push must not fail")
+        .expect("the outbox was reloaded, so there is a command to send");
+
+    assert!(
+        !push.commands.is_empty(),
+        "storage held a command and the push went out empty"
+    );
+}
+
+/// An outbox reload that cannot read storage refuses to build a push rather than building an empty one.
+///
+/// The counterpart to the test above: reporting `Ok(None)` here would be indistinguishable from
+/// "there is nothing to send", which is the one answer the engine has no basis for.
+#[test]
+fn a_push_is_not_built_while_the_outbox_cannot_be_reloaded() {
+    let (mut engine, storage) = common::new_engine();
+
+    storage.with_mut(|s| {
+        s.fail_next = Some(StorageError::Transient {
+            detail: "committed, then lost the acknowledgement".to_owned(),
+        });
+    });
+    engine
+        .enqueue(common::entry(7, 0))
+        .expect_err("the transaction failed");
+
+    storage.with_mut(|s| {
+        s.fail_read = Some(StorageError::Corrupt {
+            detail: "cannot read the outbox back".to_owned(),
+        });
+    });
+    engine
+        .build_push(common::protocol(), 1_000_000)
+        .expect_err("an unreadable outbox must not read as an empty one");
 }

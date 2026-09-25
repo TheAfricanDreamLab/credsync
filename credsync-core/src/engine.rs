@@ -176,9 +176,28 @@ where
     }
 
     /// This client's cursor and digest for a scope, if it has any.
+    ///
+    /// Answers *what this engine currently believes*, which after a failed transaction is
+    /// deliberately unchanged — `a_failed_transaction_does_not_advance_the_engine` asserts exactly
+    /// that. Ask [`needs_reload`](Self::needs_reload) before building a request from it.
+    ///
+    /// An earlier version returned `None` while a scope was suspect. That conflated two different
+    /// questions — what the engine believes, and what is safe to send — and broke the property the
+    /// test above exists to protect.
     #[must_use]
     pub fn scope_state(&self, scope: &ScopeId) -> Option<&ScopeState> {
         self.scopes.get(scope)
+    }
+
+    /// Whether this scope's cached state is of unknown accuracy after a failed transaction.
+    ///
+    /// **A pull must not be built from a scope while this is true.** The cursor may point past rows
+    /// a `begin_rebootstrap` cleared, or behind writes that committed and were reported as failed,
+    /// and the engine cannot tell which — that is what the flag means. The next
+    /// [`apply_batch`](Self::apply_batch) reloads from storage and clears it.
+    #[must_use]
+    pub fn needs_reload(&self, scope: &ScopeId) -> bool {
+        self.suspect.contains(scope)
     }
 
     /// Applies one pulled batch: validate, stage, commit, then advance.
@@ -484,7 +503,33 @@ where
         }))
     }
 
+    /// Reconciles a scope with storage after a failed transaction, if it needs it.
+    ///
+    /// Call this when [`needs_reload`](Self::needs_reload) is true and before building a request
+    /// from the scope. A caller that merely *skips* suspect scopes deadlocks: the flag is cleared
+    /// by an apply, an apply needs a pull, and the pull is what was skipped. The simulator's
+    /// convergence invariant caught exactly that — *"still at cursor 49 after settling, with the
+    /// server at 51; the device never caught up"*.
+    ///
+    /// Reloads the scope's cursor and digest, and the outbox, both of which a failed transaction
+    /// makes untrustworthy for the same reason.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError::Storage`] if the reload fails. The scope stays suspect, so the next
+    /// attempt tries again rather than proceeding on state it does not trust.
+    pub fn reload_scope(&mut self, scope: &ScopeId) -> Result<(), ApplyError> {
+        self.refresh_if_suspect(scope)?;
+        self.refresh_outbox_if_suspect().map_err(|_| {
+            ApplyError::Storage(crate::StorageError::Corrupt {
+                detail: "the outbox could not be reloaded".to_owned(),
+            })
+        })
+    }
+
     /// Reloads a scope's cursor and digest from storage if a previous transaction failed on it.
+    ///
+    /// Runs at the head of every apply, and from [`reload_scope`](Self::reload_scope) when a
+    /// caller needs the scope trustworthy before it builds a request.
     ///
     /// # Why a failed write means the cache is stale, not merely behind
     ///
@@ -641,7 +686,14 @@ where
                 digest: ScopeDigest::EMPTY.to_hex(),
             },
         ];
-        self.storage.transact(&ops)?;
+        if let Err(e) = self.storage.transact(&ops) {
+            // The clear may have committed and been reported as failed, in which case the cached
+            // cursor now points into rows that are gone — and a pull built from it would ask the
+            // server to resume past changes this device no longer holds.
+            self.suspect.insert(scope.clone());
+            self.outbox_suspect = true;
+            return Err(e.into());
+        }
 
         // Only after the commit. A reset held in memory over a transaction that failed would have
         // the engine re-bootstrapping onto rows it believes are gone.
@@ -812,6 +864,13 @@ where
         protocol: ProtocolVersion,
         budget_bytes: usize,
     ) -> Result<Option<PushRequest>, OutboxError> {
+        // Before the empty check, not after. If `enqueue` committed and was told it failed, the
+        // in-memory queue is empty while storage holds the command — and returning early on
+        // `is_empty()` would leave it unsent for the life of the install, with `apply_results`
+        // never reached because no push was ever built. Found in review on #77, where the reload
+        // this comment describes had silently failed to apply at all.
+        self.refresh_outbox_if_suspect()?;
+
         // The server has already refused this protocol version, so a push can only be refused
         // again. The outbox is left exactly as it is — see `on_upgrade_required`.
         if self.upgrade_required.is_some() {

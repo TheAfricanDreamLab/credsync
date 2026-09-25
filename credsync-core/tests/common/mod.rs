@@ -61,6 +61,14 @@ pub struct FakeStorage {
     pub quarantine: Vec<(EntityId, Snapshot, SchemaVersion, String)>,
     /// How many times each scope has diverged, so escalation survives a restart.
     pub divergences: BTreeMap<ScopeId, (u32, bool)>,
+    /// How many times `scope_state` was read.
+    ///
+    /// Counted because `attempts` counts *transactions*, and every successful `apply_batch` makes
+    /// one — so asserting on it proves nothing about whether the engine re-read anything. A test
+    /// written that way passes with the defence deleted, which is what happened on #77.
+    ///
+    /// A `Cell` so the count moves from `&self`, which is what the read methods have.
+    pub scope_reads: Cell<usize>,
 }
 
 impl FakeStorage {
@@ -270,6 +278,7 @@ impl Storage for FakeStorage {
     }
 
     fn scope_state(&self, scope: &ScopeId) -> Result<Option<StoredScope>, StorageError> {
+        self.scope_reads.set(self.scope_reads.get() + 1);
         if let Some(e) = &self.fail_read {
             return Err(e.clone());
         }

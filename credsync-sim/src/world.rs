@@ -428,6 +428,20 @@ impl World {
 
     /// Sends a pull for this device's scope.
     fn pull_step(&mut self, i: usize) {
+        // A scope whose cached cursor is of unknown accuracy must not be pulled from: the cursor
+        // may point past rows a rebuild cleared, or behind writes that committed and were reported
+        // as failed. The next apply reloads it from storage and clears the flag; until then, a
+        // request built from it would ask the server to resume from a position this device cannot
+        // support.
+        if self.devices[i].engine.needs_reload(&self.scope) {
+            let scope = self.scope.clone();
+            if self.devices[i].engine.reload_scope(&scope).is_err() {
+                // Storage is still unreadable. Nothing to pull from, and nothing lost by waiting:
+                // the scope stays suspect and the next cycle tries again.
+                return;
+            }
+        }
+
         let cursor = self.devices[i]
             .engine
             .scope_state(&self.scope)
