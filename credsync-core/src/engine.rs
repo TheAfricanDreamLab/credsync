@@ -20,7 +20,7 @@ use core::fmt;
 use credsync_protocol::{
     Batch, BootstrapResponse, Change, Command, CommandId, ConflictClass, EntityId, EntityName,
     ForcedUpgrade, Payload, ProtocolVersion, PushRequest, PushResponse, Reason, SchemaVersion,
-    ScopeId, Snapshot, Status, canonical, limits,
+    ScopeDigest, ScopeId, Snapshot, Status, canonical, limits,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -88,6 +88,18 @@ where
     registry: Registry,
     /// The host's registered up-migrations. `docs/spec.md` §7.
     migrations: Migrations,
+    /// Scopes whose cached cursor and digest may no longer match storage.
+    ///
+    /// Set whenever `transact` returns an error, because a failure does not say *which* failure: an
+    /// adapter that committed and then reported failure leaves this engine holding stale state
+    /// rather than merely unadvanced state, and it cannot tell the two apart. See
+    /// [`Storage::scope_state`] for what that costs if nobody reloads (#55).
+    suspect: BTreeSet<ScopeId>,
+    /// Set when the in-memory outbox may no longer match storage.
+    ///
+    /// Not keyed by scope, because the outbox is not: one failed transaction makes the whole queue
+    /// of unknown accuracy. See [`Storage::outbox`] for the second outcome it otherwise produces.
+    outbox_suspect: bool,
     /// Per-scope divergence state. `docs/spec.md` §5.
     ///
     /// Keyed by scope so a tainted scope cannot stop the others syncing, which the spec requires
@@ -124,6 +136,8 @@ where
             migrations: Migrations::new(),
             upgrade_required: None,
             health: BTreeMap::new(),
+            suspect: BTreeSet::new(),
+            outbox_suspect: false,
         }
     }
 
@@ -162,9 +176,28 @@ where
     }
 
     /// This client's cursor and digest for a scope, if it has any.
+    ///
+    /// Answers *what this engine currently believes*, which after a failed transaction is
+    /// deliberately unchanged — `a_failed_transaction_does_not_advance_the_engine` asserts exactly
+    /// that. Ask [`needs_reload`](Self::needs_reload) before building a request from it.
+    ///
+    /// An earlier version returned `None` while a scope was suspect. That conflated two different
+    /// questions — what the engine believes, and what is safe to send — and broke the property the
+    /// test above exists to protect.
     #[must_use]
     pub fn scope_state(&self, scope: &ScopeId) -> Option<&ScopeState> {
         self.scopes.get(scope)
+    }
+
+    /// Whether this scope's cached state is of unknown accuracy after a failed transaction.
+    ///
+    /// **A pull must not be built from a scope while this is true.** The cursor may point past rows
+    /// a `begin_rebootstrap` cleared, or behind writes that committed and were reported as failed,
+    /// and the engine cannot tell which — that is what the flag means. The next
+    /// [`apply_batch`](Self::apply_batch) reloads from storage and clears it.
+    #[must_use]
+    pub fn needs_reload(&self, scope: &ScopeId) -> bool {
+        self.suspect.contains(scope)
     }
 
     /// Applies one pulled batch: validate, stage, commit, then advance.
@@ -248,6 +281,11 @@ where
         compare_digest: bool,
         rebuilding: bool,
     ) -> Result<Applied, ApplyError> {
+        // A previous transaction failed on this scope, so the cached cursor and digest are of
+        // unknown accuracy: the adapter may have committed and then reported failure, which leaves
+        // them stale rather than merely unadvanced. Re-read the truth before touching it.
+        self.refresh_if_suspect(&batch.scope)?;
+
         let state = self.scopes.get(&batch.scope).copied().unwrap_or_default();
 
         apply::validate_ordering(batch, state.cursor.get())?;
@@ -365,7 +403,17 @@ where
             });
         }
 
-        let outcome = self.storage.transact(&ops)?;
+        let outcome = match self.storage.transact(&ops) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Whatever went wrong, this engine no longer knows whether the write landed. The
+                // next apply for this scope reloads rather than trusting memory, and so does the
+                // next thing that touches the outbox.
+                self.suspect.insert(batch.scope.clone());
+                self.outbox_suspect = true;
+                return Err(e.into());
+            }
+        };
         debug_assert_eq!(
             outcome.applied,
             ops.len(),
@@ -455,6 +503,104 @@ where
         }))
     }
 
+    /// Reconciles a scope with storage after a failed transaction, if it needs it.
+    ///
+    /// Call this when [`needs_reload`](Self::needs_reload) is true and before building a request
+    /// from the scope. A caller that merely *skips* suspect scopes deadlocks: the flag is cleared
+    /// by an apply, an apply needs a pull, and the pull is what was skipped. The simulator's
+    /// convergence invariant caught exactly that — *"still at cursor 49 after settling, with the
+    /// server at 51; the device never caught up"*.
+    ///
+    /// Reloads the scope's cursor and digest, and the outbox, both of which a failed transaction
+    /// makes untrustworthy for the same reason.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError::Storage`] if the reload fails. The scope stays suspect, so the next
+    /// attempt tries again rather than proceeding on state it does not trust.
+    pub fn reload_scope(&mut self, scope: &ScopeId) -> Result<(), ApplyError> {
+        self.refresh_if_suspect(scope)?;
+        self.refresh_outbox_if_suspect().map_err(|_| {
+            ApplyError::Storage(crate::StorageError::Corrupt {
+                detail: "the outbox could not be reloaded".to_owned(),
+            })
+        })
+    }
+
+    /// Reloads a scope's cursor and digest from storage if a previous transaction failed on it.
+    ///
+    /// Runs at the head of every apply, and from [`reload_scope`](Self::reload_scope) when a
+    /// caller needs the scope trustworthy before it builds a request.
+    ///
+    /// # Why a failed write means the cache is stale, not merely behind
+    ///
+    /// `apply_changes` advances memory only after `transact` returns `Ok`, which is correct and
+    /// insufficient. An adapter that commits and *then* reports failure leaves storage ahead of
+    /// memory, and the next apply re-fetches changes storage already holds. `stage_change` then
+    /// reads a `row_version` that is already the new value, so `digest.update(new, new)` is a
+    /// no-op — and the stale in-memory digest is written back over the correct stored one.
+    ///
+    /// The rows stay right. The digest regresses permanently, and the scope reports divergence on
+    /// every pull for the rest of its life: silent, and exactly the shape of failure this project
+    /// exists to prevent (#55).
+    ///
+    /// The contract says an adapter must never do this. This defends anyway, because the engine
+    /// cannot distinguish "nothing was written" from "everything was written and I was not told",
+    /// and the cost of assuming the worse one is a single read.
+    ///
+    /// # Errors
+    /// Returns [`ApplyError::Storage`] if the reload fails. The scope stays suspect, so the next
+    /// attempt tries again rather than proceeding on state it does not trust.
+    fn refresh_if_suspect(&mut self, scope: &ScopeId) -> Result<(), ApplyError> {
+        if !self.suspect.contains(scope) {
+            return Ok(());
+        }
+
+        match self.storage.scope_state(scope)? {
+            Some(stored) => {
+                // A digest storage cannot parse is treated as empty rather than guessed at: an
+                // empty digest disagrees with the server on the next pull, which reports divergence
+                // and heals (CS-22). A guessed one would agree by accident and never heal.
+                let digest = u128::from_str_radix(stored.digest.as_str(), 16)
+                    .map_or(ScopeDigest::EMPTY, ScopeDigest::from_raw);
+                self.scopes
+                    .insert(scope.clone(), ScopeState::restored(stored.cursor, digest));
+            }
+            // Storage holds nothing for this scope, so neither should memory. Leaving a cached
+            // cursor here would have the client resume from a position storage cannot support.
+            None => {
+                self.scopes.remove(scope);
+            }
+        }
+
+        // Cleared only after the reload succeeded.
+        self.suspect.remove(scope);
+        Ok(())
+    }
+
+    /// Reloads the outbox from storage if a previous transaction failed.
+    ///
+    /// The same defence as [`refresh_if_suspect`](Self::refresh_if_suspect), for the queue rather
+    /// than the scope. An adapter that committed and reported failure leaves entries resolved in
+    /// storage and still queued in memory; pushing them again earns the same verdict from the
+    /// server's dedupe table and records a **second** outcome for one command.
+    ///
+    /// `docs/spec.md` §3.3 gives one result per submitted command, and the user's dead-letter list
+    /// is built by counting those records — so a duplicate is a user-visible wrong number, not an
+    /// internal tidiness question.
+    ///
+    /// # Errors
+    /// Returns [`OutboxError::Storage`] if the reload fails. The flag stays set, so the next
+    /// attempt tries again rather than proceeding on a queue it does not trust.
+    fn refresh_outbox_if_suspect(&mut self) -> Result<(), OutboxError> {
+        if !self.outbox_suspect {
+            return Ok(());
+        }
+        let stored = self.storage.outbox()?;
+        self.outbox = stored.into_iter().collect();
+        self.outbox_suspect = false;
+        Ok(())
+    }
+
     /// How much this client trusts its copy of a scope. `docs/spec.md` §5.
     #[must_use]
     pub fn scope_health(&self, scope: &ScopeId) -> ScopeHealth {
@@ -537,10 +683,17 @@ where
             },
             StorageOp::SetScopeDigest {
                 scope: scope.clone(),
-                digest: credsync_protocol::ScopeDigest::EMPTY.to_hex(),
+                digest: ScopeDigest::EMPTY.to_hex(),
             },
         ];
-        self.storage.transact(&ops)?;
+        if let Err(e) = self.storage.transact(&ops) {
+            // The clear may have committed and been reported as failed, in which case the cached
+            // cursor now points into rows that are gone — and a pull built from it would ask the
+            // server to resume past changes this device no longer holds.
+            self.suspect.insert(scope.clone());
+            self.outbox_suspect = true;
+            return Err(e.into());
+        }
 
         // Only after the commit. A reset held in memory over a transaction that failed would have
         // the engine re-bootstrapping onto rows it believes are gone.
@@ -651,10 +804,13 @@ where
     pub fn enqueue(&mut self, entry: OutboxEntry) -> Result<(), OutboxError> {
         self.registry.check_command(&entry.command)?;
 
-        self.storage.transact(&[StorageOp::EnqueueCommand {
+        if let Err(e) = self.storage.transact(&[StorageOp::EnqueueCommand {
             command: entry.command.clone(),
             schema_version: entry.schema_version,
-        }])?;
+        }]) {
+            self.outbox_suspect = true;
+            return Err(e.into());
+        }
         self.outbox.push_back(entry);
         Ok(())
     }
@@ -708,6 +864,13 @@ where
         protocol: ProtocolVersion,
         budget_bytes: usize,
     ) -> Result<Option<PushRequest>, OutboxError> {
+        // Before the empty check, not after. If `enqueue` committed and was told it failed, the
+        // in-memory queue is empty while storage holds the command — and returning early on
+        // `is_empty()` would leave it unsent for the life of the install, with `apply_results`
+        // never reached because no push was ever built. Found in review on #77, where the reload
+        // this comment describes had silently failed to apply at all.
+        self.refresh_outbox_if_suspect()?;
+
         // The server has already refused this protocol version, so a push can only be refused
         // again. The outbox is left exactly as it is — see `on_upgrade_required`.
         if self.upgrade_required.is_some() {
@@ -865,6 +1028,10 @@ where
     /// Returns [`OutboxError::Storage`] if the resolutions could not be committed. Nothing is
     /// removed from the in-memory outbox in that case, so the push is simply retried.
     pub fn apply_results(&mut self, response: &PushResponse) -> Result<Resolved, OutboxError> {
+        // A previous transaction failed, so entries this engine believes are queued may already be
+        // resolved in storage. Answering for them again records a second outcome for one command,
+        // which `docs/spec.md` §3.3 forbids and which inflates the user's dead-letter list.
+        self.refresh_outbox_if_suspect()?;
         let mut ops: Vec<StorageOp> = Vec::new();
         let mut resolutions: Vec<(CommandId, Resolution)> = Vec::new();
         let mut unknown = 0usize;
@@ -955,7 +1122,10 @@ where
         // Reversed, a failed commit would leave commands gone from memory and still pending in
         // storage: resurrected at the next launch and pushed again, which the server would dedupe
         // -- but the user's dead-letter would have silently vanished in the meantime.
-        self.storage.transact(&ops)?;
+        if let Err(e) = self.storage.transact(&ops) {
+            self.outbox_suspect = true;
+            return Err(e.into());
+        }
 
         for (id, _) in &resolutions {
             self.outbox.retain(|e| e.id() != *id);

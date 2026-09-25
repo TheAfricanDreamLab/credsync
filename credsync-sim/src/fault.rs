@@ -51,6 +51,18 @@ pub struct FaultRates {
     pub server_restart: u32,
     /// Restart a device, reloading its engine from storage.
     pub device_restart: u32,
+    /// Commit a storage transaction, report failure, and **leave the device running**.
+    ///
+    /// Distinct from `storage_commit_then_kill`, which pairs the same lie with a restart — and the
+    /// restart is what made it survivable, because a restarted engine reloads everything from
+    /// storage and never consults the state the lie invalidated.
+    ///
+    /// Without the restart the engine keeps a cursor and digest that are behind what storage holds,
+    /// re-fetches changes storage already has, and writes the stale digest back over the correct
+    /// one. The rows stay right and the digest regresses permanently (#55). Adding the fault is
+    /// what makes the defence testable: the paired version could never reach it.
+    pub storage_lie_about_commit: u32,
+
     /// Put the server under load, so it sheds by delivering less and processing fewer commands.
     ///
     /// Without this the simulator only ever saw a server with spare capacity, so the whole
@@ -107,6 +119,7 @@ impl Default for FaultRates {
             protocol_violation: 5,
             slow_commit: 8,
             overload: 6,
+            storage_lie_about_commit: 5,
             latency_ms: (20, 2_000),
         }
     }
@@ -130,6 +143,7 @@ impl FaultRates {
             protocol_violation: 0,
             slow_commit: 0,
             overload: 0,
+            storage_lie_about_commit: 0,
             latency_ms: (10, 10),
         }
     }
@@ -168,6 +182,8 @@ pub enum Fault {
     SlowCommit,
     /// The server went under load and started shedding.
     Overloaded,
+    /// A storage transaction committed and reported failure, with the device still running.
+    StorageLiedAboutCommit,
 }
 
 impl Fault {
@@ -189,6 +205,7 @@ impl Fault {
             Self::ServerRestarted => "server-restarted",
             Self::DeviceRestarted => "device-restarted",
             Self::Overloaded => "overloaded",
+            Self::StorageLiedAboutCommit => "storage-lied-about-commit",
             Self::ProtocolViolation => "protocol-violation",
             Self::SlowCommit => "slow-commit",
         }
@@ -198,7 +215,7 @@ impl Fault {
     ///
     /// A `const` list rather than a derived iterator so that adding a variant without adding it
     /// here is visible: the coverage report would show one fewer row than the menu.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Dropped,
         Self::Duplicated,
         Self::Reordered,
@@ -212,6 +229,7 @@ impl Fault {
         Self::ProtocolViolation,
         Self::SlowCommit,
         Self::Overloaded,
+        Self::StorageLiedAboutCommit,
     ];
 }
 
@@ -251,13 +269,19 @@ pub fn decide_response(rng: &mut Rng, rates: &FaultRates, request_index: u64) ->
 /// Decides what happens to one storage transaction.
 #[must_use]
 pub fn decide_storage(rng: &mut Rng, rates: &FaultRates) -> Option<Fault> {
+    // Every draw happens, every time, whatever the outcome. A short-circuit would change how many
+    // numbers the generator consumes depending on which branch won, and the *next* decision would
+    // then depend on this one -- a classic way to lose determinism.
     let fail = rng.chance(rates.storage_fail_before_commit);
     let kill = rng.chance(rates.storage_commit_then_kill);
+    let lie = rng.chance(rates.storage_lie_about_commit);
 
     if fail {
         Some(Fault::StorageFailed)
     } else if kill {
         Some(Fault::StorageCommittedThenKilled)
+    } else if lie {
+        Some(Fault::StorageLiedAboutCommit)
     } else {
         None
     }

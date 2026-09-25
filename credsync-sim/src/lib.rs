@@ -38,6 +38,23 @@ pub use server::Server;
 pub use trace::Trace;
 pub use world::World;
 
+/// The draw schedule this simulator uses. **Bumped whenever a seed stops meaning what it meant.**
+///
+/// D-051 wanted seeds to be good indefinitely, and pinned the generator so a dependency bump could
+/// not silently change them. That is necessary and not sufficient: adding a fault adds an RNG draw,
+/// which shifts every later decision, so the same seed replays a *different* run. The generator is
+/// stable and the schedule is not.
+///
+/// It had already happened unnoticed — `overload` added a draw at CS-18 — which is the argument for
+/// recording this rather than promising something nothing enforces. A seed carries its version, so
+/// an old one is **detectably** stale rather than quietly misleading, which is the difference
+/// between a bug report that can be reproduced and one that wastes an afternoon.
+///
+/// Bump it when a fault is added or removed, when a rate's draw moves, or when `decide_*` changes
+/// how many numbers it consumes. Not for a rate's *value*: that changes which faults fire, not what
+/// the seed addresses.
+pub const SIM_VERSION: u32 = 2;
+
 /// How many steps of simulated time one run covers.
 ///
 /// At one minute per step this is a fortnight of device life, which is the scale `docs/spec.md`
