@@ -27,6 +27,35 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  sim-deep:
+    name: simulation, deep sweep
+    runs-on: ubuntu-latest
+    # Generous rather than tight, for the reason the fuzz job gives below: a run that needed
+    # longer should be reported as slow, not truncated into a green tick.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build the simulator
+        run: cargo build --release -p credsync-sim
+
+      # The range MOVES each night. A sweep that searched 0..10_000 every night would re-search
+      # the same ten thousand schedules and find nothing it had not found on the first night --
+      # a job that burns four hours to confirm yesterday's answer, which is indistinguishable
+      # from a job that is not running at all.
+      #
+      # `github.run_number` increments per workflow run and never repeats, so each night starts
+      # where the last one stopped and the search keeps moving outward forever. It also means a
+      # failing seed names a run: the number in the report is the whole reproduction, and
+      # `--seed 0x...` replays it on any machine (D-093 for what "any" is bounded by).
+      - name: sweep
+        run: |
+          from=$(( ${{ github.run_number }} * 10000 ))
+          echo "sweeping seeds $from .. $(( from + 10000 - 1 ))"
+          ./target/release/credsync-sim --from "$from" --seeds 10000
+
   fuzz-deep:
     name: fuzz, long run
     runs-on: ubuntu-latest

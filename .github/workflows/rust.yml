@@ -228,6 +228,34 @@ jobs:
         with:
           command: check licenses bans sources advisories
 
+  sim-sweep:
+    name: simulation sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Release, not debug. The sweep is ~5x faster optimised, and the simulator has no debug
+      # assertions the release build would skip -- every invariant it checks is ordinary code.
+      - name: build the simulator
+        run: cargo build --release -p credsync-sim
+
+      # The number is measured, not chosen. See CLAUDE.md section 5 for the figure this job was
+      # sized against; if it drifts, the honest move is to change BOTH this line and that one
+      # rather than to let the document promise a sweep nobody runs.
+      #
+      # Sized by the same argument as the fuzz smoke job above: depth belongs in the nightly run,
+      # and a gate slow enough to be routed around is worse than a shorter one people keep. What
+      # this job buys is the shallow catch -- an invariant broken on the commit that broke it,
+      # rather than the next morning.
+      #
+      # Until this existed the sweep ran on no machine but the author's, and #79 was found only
+      # because one was run by hand. A gate whose execution depends on somebody remembering is a
+      # gate that is already failing.
+      - name: sweep
+        run: ./target/release/credsync-sim --seeds 150
+
   crate-metadata:
     name: crate licence metadata
     runs-on: ubuntu-latest
