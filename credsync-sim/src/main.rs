@@ -31,22 +31,34 @@ fn main() -> ExitCode {
         return run_one(seed, trace_wanted);
     }
 
-    let seeds = flag_value(&args, "--seeds")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1_000);
+    // Absent means "use the default"; present but unparseable means the caller meant something and
+    // got it wrong. Those must not read alike: a CI job whose `--from` expression produced an empty
+    // string would otherwise sweep 0..N every night and report success, which is the exact failure
+    // this flag exists to prevent (#78).
+    let seeds = match option(&args, "--seeds", 1_000, |v| v.parse::<u64>().ok()) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::FAILURE,
+    };
+    let from = match option(&args, "--from", 0, parse_seed) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::FAILURE,
+    };
+    let default_jobs = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let jobs = match option(&args, "--jobs", default_jobs, |v| {
+        v.parse::<usize>().ok().filter(|n| *n > 0)
+    }) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::FAILURE,
+    };
 
-    // Where the batch starts. A nightly job that sweeps 0..10_000 every night re-searches the same
-    // ten thousand schedules and finds nothing after the first night, so the range has to move.
-    let from = flag_value(&args, "--from")
-        .and_then(|v| parse_seed(&v))
-        .unwrap_or(0);
-
-    let jobs = flag_value(&args, "--jobs")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
-        })
-        .max(1);
+    // A range that runs off the end of u64 would saturate, start no worker for the lost seeds, and
+    // still report the full requested count green -- a sweep that claims coverage it never had.
+    if from.checked_add(seeds).is_none() {
+        eprintln!(
+            "error: --from 0x{from:x} plus --seeds {seeds} runs past the end of the seed space"
+        );
+        return ExitCode::FAILURE;
+    }
 
     run_batch(from, seeds, jobs)
 }
@@ -183,6 +195,13 @@ fn run_batch(from: u64, seeds: u64, jobs: usize) -> ExitCode {
         // A panicking stripe is a broken simulator, not a failing seed, and the two must not read
         // alike: reporting it as a seed failure would send someone chasing an invariant that never
         // fired.
+        //
+        // This arm runs in debug and under `cargo test`. It does NOT run in the release builds both
+        // CI jobs use, because the workspace sets `panic = "abort"` there, so the process dies on
+        // the panic itself and never reaches the join. That is still unambiguous -- an abort with a
+        // panic message is nobody's idea of a seed failure -- but it is worth stating rather than
+        // leaving this to read as a guarantee it cannot offer in the build that matters
+        // (found in review on #81).
         let Ok(outcome) = handle.join() else {
             eprintln!("error: a simulator thread panicked; this is a bug in the simulator itself");
             return ExitCode::FAILURE;
@@ -205,9 +224,13 @@ fn run_batch(from: u64, seeds: u64, jobs: usize) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let wall = started.elapsed();
+    // Deterministic output on stdout, measurement on stderr. A seeded run's report must be the
+    // same bytes on every machine and every date, and elapsed time is neither -- `.coderabbit.yaml`
+    // bans real clocks reaching the simulator's output for exactly this reason. The timing is still
+    // printed, because sizing the CI sweep needs it (#78); it is just not part of the report.
     let last = from.saturating_add(seeds).saturating_sub(1);
-    println!("{seeds}/{seeds} seeds green in {wall:.2?}  (0x{from:016x}..=0x{last:016x})");
+    println!("{seeds}/{seeds} seeds green  (0x{from:016x}..=0x{last:016x})");
+    eprintln!("took {:.2?}", started.elapsed());
     println!(
         "simulated {} of device life across the batch",
         human_duration(simulated_ms)
@@ -240,6 +263,25 @@ fn run_batch(from: u64, seeds: u64, jobs: usize) -> ExitCode {
 }
 
 /// The value after `flag`, if present.
+/// Reads a flag, distinguishing "absent" from "present and wrong".
+///
+/// `Ok(default)` when the flag is absent, `Ok(v)` when it parses, and `Err(())` after printing a
+/// message when it does not. Falling back to the default on a bad value would let a typo or an
+/// empty shell expansion look like a deliberate choice.
+fn option<T>(
+    args: &[String],
+    flag: &str,
+    default: T,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<T, ()> {
+    match flag_value(args, flag) {
+        None => Ok(default),
+        Some(raw) => parse(&raw).ok_or_else(|| {
+            eprintln!("error: {flag} does not accept {raw:?}");
+        }),
+    }
+}
+
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).cloned()
@@ -284,4 +326,62 @@ A bug report is one integer. If a batch fails, replay its seed:
 
     cargo run -p credsync-sim -- --seed 0x4f21a9c3 --trace"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{option, parse_seed};
+
+    /// An absent flag takes the default; a present one that parses takes its value.
+    #[test]
+    fn a_flag_that_is_absent_or_valid_is_accepted() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            option(&none, "--seeds", 1_000, |v| v.parse::<u64>().ok()),
+            Ok(1_000)
+        );
+
+        let given = vec!["--seeds".to_owned(), "42".to_owned()];
+        assert_eq!(
+            option(&given, "--seeds", 1_000, |v| v.parse::<u64>().ok()),
+            Ok(42)
+        );
+    }
+
+    /// A flag that is present and unparseable is refused, not quietly defaulted.
+    ///
+    /// The failure this prevents is specific and silent: a CI expression that produced an empty
+    /// string or a stray word would have sent `--from` back to seed 0, and the nightly job would
+    /// re-sweep the same range every night while reporting success — the exact thing the flag was
+    /// added to stop (#78). "Absent" and "present and wrong" are different answers.
+    #[test]
+    fn a_flag_that_is_present_and_wrong_is_refused() {
+        let bad = vec!["--from".to_owned(), "not-a-seed".to_owned()];
+        assert_eq!(option(&bad, "--from", 0u64, parse_seed), Err(()));
+
+        // Zero workers would start no threads and report every seed green.
+        let zero = vec!["--jobs".to_owned(), "0".to_owned()];
+        assert_eq!(
+            option(&zero, "--jobs", 4usize, |v| v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)),
+            Err(())
+        );
+    }
+
+    /// A range running off the end of the seed space is refused before any stripe is built.
+    ///
+    /// Saturating arithmetic would otherwise clamp both bounds to `u64::MAX`, start no worker for
+    /// the seeds that fell off, and print the full requested count as green — a sweep claiming
+    /// coverage it never had, which is worse than a sweep that failed (found in review on #81).
+    #[test]
+    fn a_range_that_runs_past_the_end_of_the_seed_space_is_refused() {
+        assert!(u64::MAX.checked_add(1).is_none(), "the guard's premise");
+        assert!((u64::MAX - 1).checked_add(2).is_none());
+        assert!(
+            1_000u64.checked_add(10_000).is_some(),
+            "an ordinary range still passes"
+        );
+    }
 }

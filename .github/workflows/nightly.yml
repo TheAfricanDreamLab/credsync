@@ -43,18 +43,33 @@ jobs:
 
       # The range MOVES each night. A sweep that searched 0..10_000 every night would re-search
       # the same ten thousand schedules and find nothing it had not found on the first night --
-      # a job that burns four hours to confirm yesterday's answer, which is indistinguishable
-      # from a job that is not running at all.
+      # a job that burns an hour and a half to confirm yesterday's answer, which is
+      # indistinguishable from a job that is not running at all.
       #
-      # `github.run_number` increments per workflow run and never repeats, so each night starts
-      # where the last one stopped and the search keeps moving outward forever. It also means a
-      # failing seed names a run: the number in the report is the whole reproduction, and
-      # `--seed 0x...` replays it on any machine (D-093 for what "any" is bounded by).
+      # `github.run_number` increments per workflow run and never repeats, so the search keeps
+      # moving outward forever. It is NOT a sweep index, though, and treating it as one leaves a
+      # hole: this workflow is already at run 5, and the PR sweep covers 0..999, so a bare
+      # `run_number * 10000` would start the first night at 50,000 and seeds 1,000..49,999 would
+      # be swept by neither job (found in review on #81).
+      #
+      # So the baseline is explicit. BASE_RUN is the first run number to use this scheme, and the
+      # range starts where the PR sweep stops. Re-running an older workflow run clamps rather than
+      # computing a negative offset.
       - name: sweep
+        env:
+          # The next nightly run at the time this job was added. Bump it only alongside a
+          # deliberate decision about which seeds have been covered.
+          BASE_RUN: 6
+          # Where the per-PR sweep stops; the nightly search continues from there.
+          FIRST_SEED: 1000
+          WIDTH: 10000
         run: |
-          from=$(( ${{ github.run_number }} * 10000 ))
-          echo "sweeping seeds $from .. $(( from + 10000 - 1 ))"
-          ./target/release/credsync-sim --from "$from" --seeds 10000
+          set -euo pipefail
+          n=${{ github.run_number }}
+          if [ "$n" -lt "$BASE_RUN" ]; then n=$BASE_RUN; fi
+          from=$(( FIRST_SEED + (n - BASE_RUN) * WIDTH ))
+          echo "run $n sweeping seeds $from .. $(( from + WIDTH - 1 ))"
+          ./target/release/credsync-sim --from "$from" --seeds "$WIDTH"
 
   fuzz-deep:
     name: fuzz, long run
