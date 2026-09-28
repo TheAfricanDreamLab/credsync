@@ -190,8 +190,34 @@ workspace through `common::config`, so one variable retunes all of them.
 From CS-11 onward, also:
 
 ```sh
-cargo run -p credsync-sim -- --seeds 1000     # 10,000 nightly
+cargo run --release -p credsync-sim -- --seeds 1000
 ```
+
+**`--release`, and it is not optional.** The sweep is roughly five times faster optimised and the
+simulator has no debug assertions a release build would skip — every invariant it checks is
+ordinary code. In debug a single seed can take two minutes, which is the difference between a
+gate you run and a gate you mean to run.
+
+Seeds spread across cores by default (`--jobs N` to pin it). Measured: 1000 seeds in 60 minutes on
+four cores, against roughly 88 sequential. The batch splits into contiguous stripes and always
+reports the **lowest** failing seed, so a parallel run names the same seed a sequential one would.
+
+Both numbers below name a job that exists, which they did not until #78:
+
+| Where | Seeds | Measured |
+|---|---|---|
+| `rust.yml`, every PR | 1000 from 0 | 82s for 150, so ~9 min |
+| `nightly.yml`, 02:00 UTC | 10,000, range moves each run | ~91 min |
+
+The nightly range moves with `github.run_number`. A sweep that searched `0..10_000` every night
+would re-search the same ten thousand schedules and confirm yesterday's answer — indistinguishable
+from a job that is not running.
+
+**If the timing drifts, change the workflow and this table together.** For CS-11 through #79 this
+file claimed both numbers while `rust.yml` ran neither: the sweep executed on no machine but the
+author's, and a simulator bug that minted duplicate command ids after 256 per device (#79) survived
+until one was run by hand. A figure in the brief that names no job is worse than no figure, because
+it is believed.
 
 Docs are generated, so if you touched `docs/source/`:
 

@@ -241,20 +241,21 @@ jobs:
       - name: build the simulator
         run: cargo build --release -p credsync-sim
 
-      # The number is measured, not chosen. See CLAUDE.md section 5 for the figure this job was
-      # sized against; if it drifts, the honest move is to change BOTH this line and that one
-      # rather than to let the document promise a sweep nobody runs.
+      # The number is measured, not chosen. On this runner 150 seeds took 81.95s, so 1000 costs
+      # about nine minutes -- comparable to the fuzz smoke job beside it, and affordable because
+      # the batch spreads across the runner's four cores.
       #
-      # Sized by the same argument as the fuzz smoke job above: depth belongs in the nightly run,
-      # and a gate slow enough to be routed around is worse than a shorter one people keep. What
-      # this job buys is the shallow catch -- an invariant broken on the commit that broke it,
-      # rather than the next morning.
+      # 1000 is what CLAUDE.md section 5 has claimed since CS-11, so this job makes the document
+      # true rather than the document make this job smaller. If the timing ever drifts, change
+      # BOTH this line and that one: a figure in the brief that names no job is how the sweep came
+      # to run on no machine but the author's, and how #79 lived in the simulator until somebody
+      # happened to run one by hand.
       #
-      # Until this existed the sweep ran on no machine but the author's, and #79 was found only
-      # because one was run by hand. A gate whose execution depends on somebody remembering is a
-      # gate that is already failing.
+      # Depth still belongs in the nightly run, which sweeps ten thousand over a moving range.
+      # What this job buys is the shallow catch -- an invariant broken on the commit that broke
+      # it, rather than the next morning.
       - name: sweep
-        run: ./target/release/credsync-sim --seeds 150
+        run: ./target/release/credsync-sim --seeds 1000
 
   crate-metadata:
     name: crate licence metadata
