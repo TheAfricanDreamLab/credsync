@@ -209,7 +209,7 @@ than presented as the time a sweep takes:
 | Where | Seeds | Measured |
 |---|---|---|
 | `rust.yml`, every PR | 1000 from 0 | **9m34s** on a GitHub runner |
-| `nightly.yml`, 02:00 UTC | 10,000, range continues from 1000 | ~95 min, extrapolated from the above |
+| `nightly.yml`, 02:00 UTC | 20,000 — 10,000 new plus last night's | ~3.2 h, extrapolated from the above |
 | A 2021 Intel MacBook, 4 cores | 1000 | 60 min — roughly six times slower than the runner |
 
 So budget an hour if you run the full sweep on a laptop, and do not read the nine-minute figure as
@@ -219,6 +219,11 @@ The nightly range moves with `github.run_number`, anchored to an explicit baseli
 where the per-PR sweep stops rather than leaving the seeds between them to neither job. A sweep that
 searched `0..10_000` every night would re-search the same ten thousand schedules and confirm
 yesterday's answer — indistinguishable from a job that is not running.
+
+Each night also re-sweeps the previous night's range, because the run number advances whether or not
+last night passed. **One** missed or failed night is therefore fully re-covered by the next; two
+consecutive are not. That bound is deliberate — the nightly job searches for schedules nobody has
+thought of, and the per-PR sweep is what gates.
 
 **If the timing drifts, change the workflow and this table together.** For CS-11 through #79 this
 file claimed both numbers while `rust.yml` ran neither: the sweep executed on no machine but the

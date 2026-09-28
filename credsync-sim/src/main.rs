@@ -35,7 +35,10 @@ fn main() -> ExitCode {
     // got it wrong. Those must not read alike: a CI job whose `--from` expression produced an empty
     // string would otherwise sweep 0..N every night and report success, which is the exact failure
     // this flag exists to prevent (#78).
-    let seeds = match option(&args, "--seeds", 1_000, |v| v.parse::<u64>().ok()) {
+    // Zero is refused rather than accepted as "a batch of nothing". `run_batch` would start no
+    // stripe, check no invariant, and exit 0 -- a gate that cannot fail, which `.coderabbit.yaml`
+    // names as its own category of defect. A sweep that reports success has to have swept.
+    let seeds = match option(&args, "--seeds", 1_000, positive_seeds) {
         Ok(v) => v,
         Err(()) => return ExitCode::FAILURE,
     };
@@ -44,9 +47,7 @@ fn main() -> ExitCode {
         Err(()) => return ExitCode::FAILURE,
     };
     let default_jobs = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let jobs = match option(&args, "--jobs", default_jobs, |v| {
-        v.parse::<usize>().ok().filter(|n| *n > 0)
-    }) {
+    let jobs = match option(&args, "--jobs", default_jobs, positive_jobs) {
         Ok(v) => v,
         Err(()) => return ExitCode::FAILURE,
     };
@@ -111,6 +112,26 @@ fn report(seed: u64, violations: &[credsync_sim::Violation]) {
     eprintln!();
     eprintln!("replay it exactly:");
     eprintln!("  cargo run --release -p credsync-sim -- --seed 0x{seed:x} --trace");
+}
+
+/// Keeps whichever of two candidate failures names the lower seed.
+///
+/// Extracted so the claim can be *tested* rather than reasoned about. Parallelism does not change
+/// what any seed does -- each run owns its world and its generator -- but it does change the order
+/// stripes finish in, and without this the batch would report whichever failing seed a thread
+/// happened to reach first. The simulator's whole contract is that a bug report is one integer
+/// that replays identically, so two runs of the same range must name the same seed.
+///
+/// Folding rather than sorting because the violations are carried along and cloning them to sort
+/// would cost more than the comparison saves.
+fn keep_lowest(
+    current: Option<(u64, Vec<credsync_sim::Violation>)>,
+    candidate: Option<(u64, Vec<credsync_sim::Violation>)>,
+) -> Option<(u64, Vec<credsync_sim::Violation>)> {
+    match (current, candidate) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
+    }
 }
 
 /// What one stripe of seeds produced.
@@ -210,12 +231,7 @@ fn run_batch(from: u64, seeds: u64, jobs: usize) -> ExitCode {
         for (name, n) in outcome.faults {
             *totals.entry(name).or_insert(0) += n;
         }
-        // Lowest wins, so the batch reports the same seed however the threads were scheduled.
-        if let Some((seed, violations)) = outcome.failure
-            && failure.as_ref().is_none_or(|(prev, _)| seed < *prev)
-        {
-            failure = Some((seed, violations));
-        }
+        failure = keep_lowest(failure, outcome.failure);
     }
 
     if let Some((seed, violations)) = failure {
@@ -265,21 +281,47 @@ fn run_batch(from: u64, seeds: u64, jobs: usize) -> ExitCode {
 /// The value after `flag`, if present.
 /// Reads a flag, distinguishing "absent" from "present and wrong".
 ///
-/// `Ok(default)` when the flag is absent, `Ok(v)` when it parses, and `Err(())` after printing a
-/// message when it does not. Falling back to the default on a bad value would let a typo or an
-/// empty shell expansion look like a deliberate choice.
+/// `Ok(default)` only when the flag is genuinely absent. A flag that is present is then required
+/// to carry a value the parser accepts; anything else prints a message and returns `Err(())`.
+///
+/// Falling back to the default on a bad value -- or on a missing one -- would let a typo, a
+/// truncated command line or an empty shell expansion look like a deliberate choice.
+/// A seed count, which has to be at least one.
+///
+/// Named rather than written inline at the call site so the tests bind to the parser `main` uses.
+/// As a closure it was possible to test a copy of the rule and watch the real one be deleted: the
+/// planted-bug drill for this guard passed with the production filter removed, which is the whole
+/// reason it is a function (found while drilling #81).
+fn positive_seeds(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// A worker count, same rule and same reason. Zero workers would start no thread, join nothing,
+/// and report every seed green.
+fn positive_jobs(v: &str) -> Option<usize> {
+    v.parse::<usize>().ok().filter(|n| *n > 0)
+}
+
 fn option<T>(
     args: &[String],
     flag: &str,
     default: T,
     parse: impl Fn(&str) -> Option<T>,
 ) -> Result<T, ()> {
-    match flag_value(args, flag) {
-        None => Ok(default),
-        Some(raw) => parse(&raw).ok_or_else(|| {
-            eprintln!("error: {flag} does not accept {raw:?}");
-        }),
+    if !args.iter().any(|a| a == flag) {
+        return Ok(default);
     }
+    // Present with nothing after it: `--seeds` as the last argument used to read as absence and
+    // take the default, so `credsync-sim --from 50000 --seeds` would have swept 1000 seeds from
+    // 50000 and called it the range that was asked for. A trailing flag is a truncated command
+    // line, not a choice (found in review on #81).
+    let Some(raw) = flag_value(args, flag) else {
+        eprintln!("error: {flag} expects a value");
+        return Err(());
+    };
+    parse(&raw).ok_or_else(|| {
+        eprintln!("error: {flag} does not accept {raw:?}");
+    })
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -330,7 +372,7 @@ A bug report is one integer. If a batch fails, replay its seed:
 
 #[cfg(test)]
 mod tests {
-    use super::{option, parse_seed};
+    use super::{keep_lowest, option, parse_seed, positive_jobs, positive_seeds};
 
     /// An absent flag takes the default; a present one that parses takes its value.
     #[test]
@@ -359,15 +401,113 @@ mod tests {
         let bad = vec!["--from".to_owned(), "not-a-seed".to_owned()];
         assert_eq!(option(&bad, "--from", 0u64, parse_seed), Err(()));
 
-        // Zero workers would start no threads and report every seed green.
         let zero = vec!["--jobs".to_owned(), "0".to_owned()];
+        assert_eq!(option(&zero, "--jobs", 4usize, positive_jobs), Err(()));
+    }
+
+    /// A trailing flag is a truncated command line, not a choice.
+    ///
+    /// `credsync-sim --from 50000 --seeds` used to read as "--seeds absent", take the default and
+    /// sweep 1000 seeds while the caller believed they had asked for something else. Absent and
+    /// present-without-a-value are different answers, and only the first has a default.
+    #[test]
+    fn a_flag_with_no_value_after_it_is_refused() {
+        for flag in ["--seeds", "--from", "--jobs"] {
+            let truncated = vec![flag.to_owned()];
+            assert_eq!(
+                option(&truncated, flag, 7u64, |v| v.parse::<u64>().ok()),
+                Err(()),
+                "{flag} with nothing after it must not fall back to the default"
+            );
+        }
+    }
+
+    /// A zero-seed batch is refused, because it would be a gate that cannot fail.
+    ///
+    /// `--seeds 0` parses, starts no stripe, checks no invariant and exits 0. A sweep that reports
+    /// success has to have swept something; `.coderabbit.yaml` names gates that cannot fail as
+    /// their own category of defect, and this would have been one in a job whose entire purpose is
+    /// to be able to go red.
+    #[test]
+    fn a_zero_seed_batch_is_refused() {
+        let zero = vec!["--seeds".to_owned(), "0".to_owned()];
+        assert_eq!(option(&zero, "--seeds", 1_000u64, positive_seeds), Err(()));
+
+        let one = vec!["--seeds".to_owned(), "1".to_owned()];
         assert_eq!(
-            option(&zero, "--jobs", 4usize, |v| v
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)),
-            Err(())
+            option(&one, "--seeds", 1_000u64, positive_seeds),
+            Ok(1),
+            "one seed is a real batch and must still be accepted"
         );
+
+        // Zero workers would start no thread, join nothing, and call every seed green.
+        let no_jobs = vec!["--jobs".to_owned(), "0".to_owned()];
+        assert_eq!(option(&no_jobs, "--jobs", 4usize, positive_jobs), Err(()));
+    }
+
+    /// The batch reports the lowest failing seed, whatever order the stripes finish in.
+    ///
+    /// The claim parallelism puts at risk. Each seed is deterministic on its own — it owns its
+    /// world and its generator — but stripes finish in whatever order the scheduler picks, so
+    /// without this fold the batch would announce whichever failing seed a thread reached first,
+    /// and two runs of the same range could name different seeds. "A bug report is one integer"
+    /// then quietly stops being true.
+    ///
+    /// Folded over every permutation rather than one arrangement, because the failure mode here is
+    /// precisely an ordering that was not the one tried.
+    #[test]
+    fn the_lowest_failing_seed_wins_whatever_order_the_stripes_finish_in() {
+        let failure = |seed: u64| {
+            Some((
+                seed,
+                vec![credsync_sim::Violation {
+                    invariant: "no-loss",
+                    device: Some(0),
+                    detail: format!("seed {seed}"),
+                    at_ms: 0,
+                }],
+            ))
+        };
+
+        let seeds = [700u64, 42, 913];
+        for a in 0..3 {
+            for b in 0..3 {
+                for c in 0..3 {
+                    if a == b || b == c || a == c {
+                        continue;
+                    }
+                    let order = [seeds[a], seeds[b], seeds[c]];
+                    let folded = order.into_iter().fold(None, |acc, seed| {
+                        // A clean stripe between each failing one, since `None` must not displace
+                        // a failure already found.
+                        keep_lowest(keep_lowest(acc, None), failure(seed))
+                    });
+                    assert_eq!(
+                        folded.map(|(seed, _)| seed),
+                        Some(42),
+                        "order {order:?} did not report the lowest seed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Clean stripes neither invent a failure nor erase one.
+    #[test]
+    fn clean_stripes_neither_invent_nor_erase_a_failure() {
+        assert_eq!(keep_lowest(None, None), None);
+
+        let only = Some((
+            9u64,
+            vec![credsync_sim::Violation {
+                invariant: "idempotency",
+                device: None,
+                detail: "the only failure".to_owned(),
+                at_ms: 0,
+            }],
+        ));
+        let survived = (0..5).fold(only, |acc, _| keep_lowest(acc, None));
+        assert_eq!(survived.map(|(seed, _)| seed), Some(9));
     }
 
     /// A range running off the end of the seed space is refused before any stripe is built.

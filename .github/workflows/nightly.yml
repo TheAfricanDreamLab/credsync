@@ -55,6 +55,23 @@ jobs:
       # So the baseline is explicit. BASE_RUN is the first run number to use this scheme, and the
       # range starts where the PR sweep stops. Re-running an older workflow run clamps rather than
       # computing a negative offset.
+      # Each night re-sweeps the PREVIOUS night's range as well as its own, so the two ranges
+      # overlap by one width.
+      #
+      # `github.run_number` counts workflow runs, not completed seed ranges: it advances whether
+      # last night passed, failed, or was cancelled and never re-run. Without the overlap a single
+      # red or cancelled night would drop ten thousand schedules that nothing would ever look at
+      # again, and nothing would say so (found in review on #81). Deriving the range from confirmed
+      # coverage instead would need state that outlives the run -- a committed file or a cache --
+      # and a cache that evicts reintroduces exactly this bug while looking like it fixed it.
+      #
+      # The guarantee this buys is worth stating precisely, because it is not total: **one** missed
+      # or failed night is fully re-covered by the next. Two consecutive are not. That is a
+      # deliberate stopping point -- the nightly job is a search for schedules nobody has thought
+      # of, not a proof of coverage over a range, and the per-PR sweep is what actually gates.
+      #
+      # It also absorbs a stale BASE_RUN: if another run lands before this change does, the clamp
+      # and the overlap between them still leave no seed unswept.
       - name: sweep
         env:
           # The next nightly run at the time this job was added. Bump it only alongside a
@@ -62,14 +79,20 @@ jobs:
           BASE_RUN: 6
           # Where the per-PR sweep stops; the nightly search continues from there.
           FIRST_SEED: 1000
+          # New seeds per night. The batch is twice this, being the new range plus the last one.
           WIDTH: 10000
         run: |
           set -euo pipefail
           n=${{ github.run_number }}
           if [ "$n" -lt "$BASE_RUN" ]; then n=$BASE_RUN; fi
-          from=$(( FIRST_SEED + (n - BASE_RUN) * WIDTH ))
-          echo "run $n sweeping seeds $from .. $(( from + WIDTH - 1 ))"
-          ./target/release/credsync-sim --from "$from" --seeds "$WIDTH"
+
+          # The end of tonight's new range, and the start of last night's.
+          to=$(( FIRST_SEED + (n - BASE_RUN + 1) * WIDTH ))
+          from=$(( FIRST_SEED + (n - BASE_RUN - 1) * WIDTH ))
+          if [ "$from" -lt "$FIRST_SEED" ]; then from=$FIRST_SEED; fi
+
+          echo "run $n sweeping seeds $from .. $(( to - 1 ))  ($(( to - from )) seeds)"
+          ./target/release/credsync-sim --from "$from" --seeds "$(( to - from ))"
 
   fuzz-deep:
     name: fuzz, long run
