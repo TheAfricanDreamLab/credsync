@@ -830,6 +830,28 @@ mod tests {
         }
     }
 
+    /// Every byte of the counter reaches the id.
+    ///
+    /// The range test above walks `0..70_000`, which never sets the top two bytes of a `u32` — so
+    /// an implementation that wrote only the low three bytes, or only the low two, would pass it
+    /// while still being the same defect #79 was. Each power of 256 is checked directly, which is
+    /// the smallest assertion that pins every byte position.
+    ///
+    /// Found in review on #80: a regression test for a truncation bug that could itself be fooled
+    /// by truncation is not much of a regression test.
+    #[test]
+    fn every_byte_of_the_counter_reaches_the_id() {
+        let base = command_id(0, 0);
+        for shift in [0u32, 8, 16, 24] {
+            let n = 1u32 << shift;
+            assert_ne!(
+                base,
+                command_id(0, n),
+                "the counter byte at shift {shift} is dropped on the way into the id"
+            );
+        }
+    }
+
     /// Two devices at the same counter get different ids.
     ///
     /// The other half of uniqueness, and the half that survived #79 intact — worth pinning because
