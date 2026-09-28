@@ -27,6 +27,73 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  sim-deep:
+    name: simulation, deep sweep
+    runs-on: ubuntu-latest
+    # Generous rather than tight, for the reason the fuzz job gives below: a run that needed
+    # longer should be reported as slow, not truncated into a green tick.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build the simulator
+        run: cargo build --release -p credsync-sim
+
+      # The range MOVES each night. A sweep that searched 0..10_000 every night would re-search
+      # the same ten thousand schedules and find nothing it had not found on the first night --
+      # a job that burns an hour and a half to confirm yesterday's answer, which is
+      # indistinguishable from a job that is not running at all.
+      #
+      # `github.run_number` increments per workflow run and never repeats, so the search keeps
+      # moving outward forever. It is NOT a sweep index, though, and treating it as one leaves a
+      # hole: this workflow is already at run 5, and the PR sweep covers 0..999, so a bare
+      # `run_number * 10000` would start the first night at 50,000 and seeds 1,000..49,999 would
+      # be swept by neither job (found in review on #81).
+      #
+      # So the baseline is explicit. BASE_RUN is the first run number to use this scheme, and the
+      # range starts where the PR sweep stops. Re-running an older workflow run clamps rather than
+      # computing a negative offset.
+      # Each night re-sweeps the PREVIOUS night's range as well as its own, so the two ranges
+      # overlap by one width.
+      #
+      # `github.run_number` counts workflow runs, not completed seed ranges: it advances whether
+      # last night passed, failed, or was cancelled and never re-run. Without the overlap a single
+      # red or cancelled night would drop ten thousand schedules that nothing would ever look at
+      # again, and nothing would say so (found in review on #81). Deriving the range from confirmed
+      # coverage instead would need state that outlives the run -- a committed file or a cache --
+      # and a cache that evicts reintroduces exactly this bug while looking like it fixed it.
+      #
+      # The guarantee this buys is worth stating precisely, because it is not total: **one** missed
+      # or failed night is fully re-covered by the next. Two consecutive are not. That is a
+      # deliberate stopping point -- the nightly job is a search for schedules nobody has thought
+      # of, not a proof of coverage over a range, and the per-PR sweep is what actually gates.
+      #
+      # It also absorbs a stale BASE_RUN: if another run lands before this change does, the clamp
+      # and the overlap between them still leave no seed unswept.
+      - name: sweep
+        env:
+          # The next nightly run at the time this job was added. Bump it only alongside a
+          # deliberate decision about which seeds have been covered.
+          BASE_RUN: 6
+          # Where the per-PR sweep stops; the nightly search continues from there.
+          FIRST_SEED: 1000
+          # New seeds per night. The batch is twice this, being the new range plus the last one.
+          WIDTH: 10000
+        run: |
+          set -euo pipefail
+          n=${{ github.run_number }}
+          if [ "$n" -lt "$BASE_RUN" ]; then n=$BASE_RUN; fi
+
+          # The end of tonight's new range, and the start of last night's.
+          to=$(( FIRST_SEED + (n - BASE_RUN + 1) * WIDTH ))
+          from=$(( FIRST_SEED + (n - BASE_RUN - 1) * WIDTH ))
+          if [ "$from" -lt "$FIRST_SEED" ]; then from=$FIRST_SEED; fi
+
+          echo "run $n sweeping seeds $from .. $(( to - 1 ))  ($(( to - from )) seeds)"
+          ./target/release/credsync-sim --from "$from" --seeds "$(( to - from ))"
+
   fuzz-deep:
     name: fuzz, long run
     runs-on: ubuntu-latest
