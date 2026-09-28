@@ -56,7 +56,11 @@ struct Device {
     /// Requests this device has enqueued, for the periodic drop.
     requests_sent: u64,
     /// Commands this device has authored, so ids stay unique and deterministic.
-    commands_authored: u8,
+    ///
+    /// Wide enough that the counter's range and the id's range are the same set. It was a `u8`
+    /// until #79, where a 14-day run authored 264 commands on one device and the 257th reused the
+    /// 1st command's id — see `command_id`.
+    commands_authored: u32,
     /// Set when the next transaction commits and then loses its acknowledgement.
     ///
     /// The device must be **restarted** at that point, because that fault is a process kill: the
@@ -715,13 +719,31 @@ fn register(registry: &mut credsync_core::Registry, entity: &EntityName, scope: 
 }
 
 /// A UUIDv7 built from a device index and a counter, so ids are unique and reproducible.
-fn command_id(device: u8, n: u8) -> CommandId {
+///
+/// # Injective by construction, not by a bound someone remembered
+///
+/// The whole counter is written into the id, so `(device, n)` and the id it produces are in
+/// one-to-one correspondence across the counter's entire range. Two authored commands can collide
+/// only if the counter itself repeats, which needs 2^32 commands on one device against the ~264 a
+/// 14-day run reaches.
+///
+/// It used to take one byte, which made the mapping injective only over `0..256` while the counter
+/// was free to run past that. It did, at seed 0x17b: device 0 authored 264 commands, the 257th
+/// reused the 1st command's id, and the harness then reported the engine violating **no-loss** and
+/// **idempotency** — a correct engine accused by its own test rig, which is the worst shape this
+/// kind of bug takes. `wrapping_add` is what kept it quiet; a plain `+ 1` would have panicked in
+/// debug the day the counter was written (#79).
+///
+/// The lesson is the shape rather than the width: an id derived from a counter must consume the
+/// whole counter, because any narrower mapping is a collision waiting on a long enough run. Widening
+/// to `u64` would not have made it *safer*, only later.
+fn command_id(device: u8, n: u32) -> CommandId {
     let mut bytes = [0u8; 16];
     bytes[0] = 0x01;
     bytes[1] = 0x91;
     bytes[6] = 0x70;
-    bytes[14] = device;
-    bytes[15] = n;
+    bytes[11] = device;
+    bytes[12..16].copy_from_slice(&n.to_be_bytes());
     CommandId::from_bytes(bytes).unwrap_or_else(|_| unreachable!("version nibble is 7"))
 }
 
@@ -781,5 +803,70 @@ fn clone_response(
     match r {
         Ok(v) => Ok(v.clone()),
         Err(e) => Err(e.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_id;
+    use std::collections::BTreeSet;
+
+    /// A device can author far more than 256 commands without repeating an id.
+    ///
+    /// The regression for #79. Against the previous one-byte counter this fails at n = 256, which
+    /// is the point: the simulator had been inventing duplicate command ids in any run long enough
+    /// to reach it, then reporting the engine for the confusion that followed.
+    ///
+    /// 70,000 is chosen to clear two boundaries rather than one — `u8` at 256 and `u16` at 65,536 —
+    /// so a future narrowing to either is caught here rather than by a sweep three months later.
+    #[test]
+    fn a_device_can_author_far_more_than_a_byte_of_commands_without_repeating_an_id() {
+        let mut seen = BTreeSet::new();
+        for n in 0..70_000u32 {
+            assert!(
+                seen.insert(command_id(0, n)),
+                "command_id repeated an id at n = {n}"
+            );
+        }
+    }
+
+    /// Every byte of the counter reaches the id.
+    ///
+    /// The range test above walks `0..70_000`, which never sets the top two bytes of a `u32` — so
+    /// an implementation that wrote only the low three bytes, or only the low two, would pass it
+    /// while still being the same defect #79 was. Each power of 256 is checked directly, which is
+    /// the smallest assertion that pins every byte position.
+    ///
+    /// Found in review on #80: a regression test for a truncation bug that could itself be fooled
+    /// by truncation is not much of a regression test.
+    #[test]
+    fn every_byte_of_the_counter_reaches_the_id() {
+        let base = command_id(0, 0);
+        for shift in [0u32, 8, 16, 24] {
+            let n = 1u32 << shift;
+            assert_ne!(
+                base,
+                command_id(0, n),
+                "the counter byte at shift {shift} is dropped on the way into the id"
+            );
+        }
+    }
+
+    /// Two devices at the same counter get different ids.
+    ///
+    /// The other half of uniqueness, and the half that survived #79 intact — worth pinning because
+    /// the fix moved the device byte, and a mistake there would make every device share one id
+    /// space while this file's other test still passed.
+    #[test]
+    fn the_same_counter_on_different_devices_gives_different_ids() {
+        let mut seen = BTreeSet::new();
+        for device in 0..8u8 {
+            for n in 0..512u32 {
+                assert!(
+                    seen.insert(command_id(device, n)),
+                    "device {device} collided with another device at n = {n}"
+                );
+            }
+        }
     }
 }
