@@ -76,6 +76,19 @@ impl Storage for RcStorage {
     ) -> Result<Option<RowVersion>, StorageError> {
         Ok(None)
     }
+
+    /// Holds no scopes either, for the same reason as `row_version` above.
+    fn scope_state(
+        &self,
+        _scope: &credsync_protocol::ScopeId,
+    ) -> Result<Option<credsync_core::StoredScope>, StorageError> {
+        Ok(None)
+    }
+
+    /// Holds no outbox either, for the same reason as `row_version` above.
+    fn outbox(&self) -> Result<Vec<credsync_core::OutboxEntry>, StorageError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A compressor whose state cannot leave this thread either.

@@ -11,8 +11,8 @@
 
 use crate::fault::SKEW_MAGNITUDE_MS;
 use credsync_core::{
-    Clock, Compressor, Entropy, RequestId, Storage, StorageError, StorageOp, Timestamp, Transport,
-    TransportError, TxOutcome, WireRequest,
+    Clock, Compressor, Entropy, OutboxEntry, RequestId, Storage, StorageError, StorageOp,
+    StoredScope, Timestamp, Transport, TransportError, TxOutcome, WireRequest,
 };
 use credsync_protocol::{
     Command, CommandId, Cursor, EntityId, EntityName, HexString, Payload, RowVersion,
@@ -405,6 +405,28 @@ impl Storage for SimStorage {
             .rows
             .get(&(entity.clone(), entity_id.clone()))
             .map(|r| r.row_version))
+    }
+
+    fn scope_state(&self, scope: &ScopeId) -> Result<Option<StoredScope>, StorageError> {
+        let db = self.0.borrow();
+        Ok(db.cursors.get(scope).map(|cursor| StoredScope {
+            cursor: *cursor,
+            digest: db
+                .digests
+                .get(scope)
+                .cloned()
+                .unwrap_or_else(|| ScopeDigest::EMPTY.to_hex()),
+        }))
+    }
+
+    fn outbox(&self) -> Result<Vec<OutboxEntry>, StorageError> {
+        Ok(self
+            .0
+            .borrow()
+            .outbox
+            .iter()
+            .map(|(command, schema)| OutboxEntry::new(command.clone(), *schema))
+            .collect())
     }
 }
 
